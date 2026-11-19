@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
+	"strings"
 
 	"github.com/atakanakis/notification-engine/internal/domain"
 	"github.com/atakanakis/notification-engine/internal/store"
@@ -51,6 +54,48 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, log *slog.Logger,
 	}
 }
 
+// describeDecodeError turns encoding/json errors into messages about the
+// client's JSON, without Go type names such as "domain.Channel".
+func describeDecodeError(err error) string {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	switch {
+	case errors.Is(err, io.EOF):
+		return "request body is empty"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "malformed JSON: unexpected end of input"
+	case errors.As(err, &syntaxErr):
+		return fmt.Sprintf("malformed JSON at byte %d", syntaxErr.Offset)
+	case errors.As(err, &typeErr):
+		field := typeErr.Field
+		if field == "" {
+			return fmt.Sprintf("body must be a JSON object, not %s", typeErr.Value)
+		}
+		return fmt.Sprintf("field %q must be %s, not %s", field, jsonKind(typeErr.Type.Kind()), typeErr.Value)
+	case strings.HasPrefix(err.Error(), "parsing time"):
+		return "timestamps must be RFC 3339, e.g. 2026-01-02T15:04:05Z"
+	}
+	return strings.TrimPrefix(err.Error(), "json: ")
+}
+
+func jsonKind(k reflect.Kind) string {
+	switch k {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	case reflect.Map, reflect.Struct:
+		return "an object"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	}
+	return "a different type"
+}
+
 // decodeJSON reads a JSON body with a size cap and rejects unknown fields,
 // so a typo like "priorty" is reported instead of silently ignored.
 func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst any) bool {
@@ -64,7 +109,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst any) bo
 				fmt.Sprintf("request body exceeds %d bytes", maxErr.Limit))
 			return false
 		}
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_json", describeDecodeError(err))
 		return false
 	}
 	if dec.More() {

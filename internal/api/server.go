@@ -20,10 +20,19 @@ type Server struct {
 	redis *redis.Client
 	hub   *Hub
 	log   *slog.Logger
+	opts  Options
 }
 
-func NewServer(svc *service.Service, rdb *redis.Client, hub *Hub, log *slog.Logger) *Server {
-	return &Server{svc: svc, redis: rdb, hub: hub, log: log}
+type Options struct {
+	// APIKeys required on /v1 routes; empty disables authentication.
+	APIKeys []string
+	// AllowedOrigins for browser WebSocket connections, as host patterns
+	// such as "app.example.com" or "localhost:*". "*" allows any origin.
+	AllowedOrigins []string
+}
+
+func NewServer(svc *service.Service, rdb *redis.Client, hub *Hub, log *slog.Logger, opts Options) *Server {
+	return &Server{svc: svc, redis: rdb, hub: hub, log: log, opts: opts}
 }
 
 const (
@@ -69,8 +78,9 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, "/docs", http.StatusFound)
 	})
 
-	// Outermost first: correlation ID -> panic recovery -> tracing -> access log -> routes.
-	h := accessLog(s.log, mux)
+	// Outermost first: correlation ID -> panic recovery -> tracing -> access
+	// log -> API key check -> routes (JSON 404/405 for anything unmatched).
+	h := accessLog(s.log, requireAPIKey(s.opts.APIKeys, jsonFallback(mux)))
 	h = otelhttp.NewHandler(h, "notification-api",
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/metrics" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz"

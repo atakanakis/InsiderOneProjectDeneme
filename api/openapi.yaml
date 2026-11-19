@@ -17,6 +17,15 @@ info:
     Repeating a request with the same key returns the original notification
     with `200` and `Idempotent-Replayed: true` instead of creating a duplicate.
     Reusing a key with a different payload returns `409`.
+
+    **Authentication.** When the server is started with `API_KEYS`, every
+    `/v1` request needs one of those keys as `Authorization: Bearer <key>` or
+    `X-API-Key: <key>` (the WebSocket also accepts `?apiKey=`), otherwise it
+    gets `401`. Health, readiness, Prometheus metrics and these docs stay open.
+    The default local stack runs without keys.
+
+    **Errors.** Every error, including unknown routes (`404`) and wrong
+    methods (`405`), has the body `{"error": {"code", "message", "details"}}`.
 servers:
   - url: http://localhost:8080
 tags:
@@ -112,6 +121,13 @@ paths:
       operationId: createBatch
       parameters:
         - $ref: '#/components/parameters/CorrelationId'
+        - name: Idempotency-Key
+          in: header
+          description: |
+            Covers the whole batch: each item without its own `idempotencyKey`
+            gets `<key>:<index>`, so re-sending the same batch with the same
+            header replays it instead of sending every message again.
+          schema: { type: string, maxLength: 123 }
       requestBody:
         required: true
         content:
@@ -307,6 +323,7 @@ paths:
       parameters:
         - { name: notificationId, in: query, schema: { type: string, format: uuid } }
         - { name: batchId, in: query, schema: { type: string, format: uuid } }
+        - { name: apiKey, in: query, description: API key for browser clients, which cannot set headers., schema: { type: string } }
       responses:
         '101': { description: Switching protocols. }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -314,6 +331,7 @@ paths:
   /metrics:
     get:
       tags: [Observability]
+      security: []
       summary: Prometheus metrics
       responses:
         '200': { description: Prometheus text format. }
@@ -321,6 +339,7 @@ paths:
   /healthz:
     get:
       tags: [Observability]
+      security: []
       summary: Liveness probe
       responses:
         '200': { description: Process is alive. }
@@ -328,12 +347,21 @@ paths:
   /readyz:
     get:
       tags: [Observability]
+      security: []
       summary: Readiness probe (checks Postgres and Redis)
       responses:
         '200': { description: Ready to serve traffic. }
         '503': { description: A dependency is unavailable. }
 
+security:
+  - {}
+  - bearerAuth: []
+  - apiKeyHeader: []
+
 components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+    apiKeyHeader: { type: apiKey, in: header, name: X-API-Key }
   parameters:
     Id:
       name: id

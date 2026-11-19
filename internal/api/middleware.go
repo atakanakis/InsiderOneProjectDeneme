@@ -1,12 +1,15 @@
 package api
 
 import (
+	"crypto/subtle"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,6 +79,67 @@ func accessLog(log *slog.Logger, next http.Handler) http.Handler {
 			"status", rec.status, "duration_ms", elapsed.Milliseconds())
 	})
 }
+
+// requireAPIKey rejects /v1 requests without one of the configured keys.
+// Health, readiness, Prometheus metrics and the API docs stay open so load
+// balancers, scrapers and humans can reach them.
+func requireAPIKey(keys []string, next http.Handler) http.Handler {
+	if len(keys) == 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := r.Header.Get("X-API-Key")
+		if after, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+			got = after
+		}
+		if got == "" && r.URL.Path == "/v1/ws" {
+			got = r.URL.Query().Get("apiKey") // browsers cannot set WebSocket headers
+		}
+		for _, k := range keys {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="notification-api"`)
+		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API key is required")
+	})
+}
+
+// jsonFallback answers unmatched routes with the same JSON error shape as
+// every other endpoint, instead of ServeMux's plain-text 404 and 405.
+func jsonFallback(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, pattern := mux.Handler(r)
+		if pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		probe := &discardWriter{header: http.Header{}, status: http.StatusOK}
+		h.ServeHTTP(probe, r)
+		if probe.status == http.StatusMethodNotAllowed {
+			allow := probe.header.Get("Allow")
+			w.Header().Set("Allow", allow)
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+				fmt.Sprintf("%s is not allowed on %s; allowed: %s", r.Method, r.URL.Path, allow))
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", "no route for "+r.URL.Path)
+	})
+}
+
+type discardWriter struct {
+	header http.Header
+	status int
+}
+
+func (d *discardWriter) Header() http.Header         { return d.header }
+func (d *discardWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (d *discardWriter) WriteHeader(code int)        { d.status = code }
 
 func recoverer(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

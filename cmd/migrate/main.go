@@ -1,5 +1,8 @@
 // Command migrate applies the versioned database migrations embedded in the
 // binary. docker-compose runs it once before the API and workers start.
+//
+//	migrate        apply every pending migration
+//	migrate down   roll back the most recent one
 package main
 
 import (
@@ -26,6 +29,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer pool.Close()
+	if len(os.Args) > 1 && os.Args[1] == "down" {
+		if err := store.MigrateDown(ctx, pool); err != nil {
+			log.Error("migrate down", "error", err)
+			os.Exit(1)
+		}
+		log.Info("rolled back one migration")
+		return
+	}
 	if err := store.Migrate(ctx, pool); err != nil {
 		log.Error("migrate", "error", err)
 		os.Exit(1)

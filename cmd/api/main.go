@@ -63,8 +63,10 @@ func run() error {
 
 	svc := service.New(store.New(pool), events.NewRedisPublisher(rdb, log), cfg.MaxAttempts)
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(svc, rdb, hub, log).Handler(),
+		Addr: cfg.HTTPAddr,
+		Handler: api.NewServer(svc, rdb, hub, log, api.Options{
+			APIKeys: cfg.APIKeys, AllowedOrigins: cfg.WSAllowedOrigins,
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -73,7 +75,10 @@ func run() error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("api listening", "addr", cfg.HTTPAddr)
+		log.Info("api listening", "addr", cfg.HTTPAddr, "auth", len(cfg.APIKeys) > 0)
+		if len(cfg.APIKeys) == 0 {
+			log.Warn("API_KEYS is empty: the API accepts unauthenticated requests (fine locally, not in production)")
+		}
 		errc <- srv.ListenAndServe()
 	}()
 

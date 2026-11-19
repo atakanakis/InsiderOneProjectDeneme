@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -51,6 +52,15 @@ func Connect(ctx context.Context, url string, maxConns int) (*pgxpool.Pool, erro
 	if maxConns > 0 {
 		cfg.MaxConns = int32(min(maxConns, 1000))
 	}
+	// Return timestamps in UTC whatever the host's time zone, so the API
+	// always answers with "Z" times.
+	cfg.AfterConnect = func(_ context.Context, conn *pgx.Conn) error {
+		conn.TypeMap().RegisterType(&pgtype.Type{
+			Name: "timestamptz", OID: pgtype.TimestamptzOID,
+			Codec: &pgtype.TimestamptzCodec{ScanLocation: time.UTC},
+		})
+		return nil
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)
@@ -73,16 +83,32 @@ func Connect(ctx context.Context, url string, maxConns int) (*pgxpool.Pool, erro
 
 // Migrate applies all pending versioned migrations embedded in the binary.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return withMigrations(pool, func(p *goose.Provider) error {
+		if _, err := p.Up(ctx); err != nil {
+			return fmt.Errorf("apply migrations: %w", err)
+		}
+		return nil
+	})
+}
+
+// MigrateDown rolls back the most recently applied migration.
+func MigrateDown(ctx context.Context, pool *pgxpool.Pool) error {
+	return withMigrations(pool, func(p *goose.Provider) error {
+		if _, err := p.Down(ctx); err != nil {
+			return fmt.Errorf("roll back migration: %w", err)
+		}
+		return nil
+	})
+}
+
+func withMigrations(pool *pgxpool.Pool, fn func(*goose.Provider) error) error {
 	db := stdlib.OpenDBFromPool(pool)
 	defer db.Close()
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, mustSub(migrations, "migrations"))
 	if err != nil {
 		return fmt.Errorf("goose provider: %w", err)
 	}
-	if _, err := provider.Up(ctx); err != nil {
-		return fmt.Errorf("apply migrations: %w", err)
-	}
-	return nil
+	return fn(provider)
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }

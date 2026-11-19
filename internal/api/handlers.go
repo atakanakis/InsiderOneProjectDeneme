@@ -56,6 +56,9 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, n)
 }
 
+// Room for ":<index>" within domain.MaxIdempotencyKeyLength.
+const maxBatchKeyLength = domain.MaxIdempotencyKeyLength - 5
+
 type batchRequest struct {
 	Notifications []service.CreateInput `json:"notifications"`
 }
@@ -77,10 +80,27 @@ type batchResponse struct {
 }
 
 // POST /v1/notifications/batch (up to 1000 items, all-or-nothing).
+//
+// An Idempotency-Key header covers the whole batch: items without their own
+// key get "<header>:<index>", so re-sending the same batch after a timeout
+// replays it instead of sending every message twice.
 func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 	var req batchRequest
 	if !decodeJSON(w, r, maxBatchBody, &req) {
 		return
+	}
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		if len(key) > maxBatchKeyLength {
+			writeError(w, http.StatusBadRequest, "invalid_idempotency_key",
+				fmt.Sprintf("a batch Idempotency-Key may be at most %d characters", maxBatchKeyLength))
+			return
+		}
+		for i := range req.Notifications {
+			if req.Notifications[i].IdempotencyKey == nil {
+				k := fmt.Sprintf("%s:%d", key, i)
+				req.Notifications[i].IdempotencyKey = &k
+			}
+		}
 	}
 	res, err := s.svc.CreateBatch(r.Context(), req.Notifications, meta(r))
 	if err != nil {
@@ -152,6 +172,9 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 	}
 	f.From = parseTime(q.Get("from"), "from", &verr)
 	f.To = parseTime(q.Get("to"), "to", &verr)
+	if f.From != nil && f.To != nil && f.From.After(*f.To) {
+		verr.Add("from", "must not be after to")
+	}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 200 {

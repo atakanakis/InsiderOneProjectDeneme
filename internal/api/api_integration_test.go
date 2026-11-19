@@ -35,6 +35,11 @@ type client struct {
 
 func newServer(t *testing.T) *client {
 	t.Helper()
+	return newServerWith(t, api.Options{AllowedOrigins: []string{"localhost:*", "127.0.0.1:*"}})
+}
+
+func newServerWith(t *testing.T, opts api.Options) *client {
+	t.Helper()
 	env := testutil.Setup(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	hub := api.NewHub()
@@ -43,7 +48,7 @@ func newServer(t *testing.T) *client {
 	go events.Subscribe(ctx, env.Redis, log, hub.Broadcast)
 
 	svc := service.New(store.New(env.Pool), events.NewRedisPublisher(env.Redis, log), 5)
-	srv := httptest.NewServer(api.NewServer(svc, env.Redis, hub, log).Handler())
+	srv := httptest.NewServer(api.NewServer(svc, env.Redis, hub, log, opts).Handler())
 	t.Cleanup(srv.Close)
 	return &client{t: t, base: srv.URL}
 }
@@ -149,6 +154,93 @@ func TestMalformedRequests(t *testing.T) {
 
 	resp, _ = c.do("GET", "/v1/notifications/7b1c6c80-9a8e-4a5b-9d32-6f2b3a4c5d6e", nil)
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// Type errors describe the client's JSON, not Go types.
+	resp, body = c.do("POST", "/v1/notifications", map[string]any{"recipient": "+905551234567", "channel": 5, "content": "hi"})
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	msg := body["error"].(map[string]any)["message"].(string)
+	assert.Equal(t, `field "channel" must be a string, not number`, msg)
+
+	resp, body = c.do("GET", "/v1/notifications?from=2026-02-01T00:00:00Z&to=2026-01-01T00:00:00Z", nil)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Equal(t, []string{"from"}, errorFields(body))
+}
+
+// Every error, including unmatched routes, uses the same JSON shape.
+func TestUnknownRoutesAndMethodsAnswerJSON(t *testing.T) {
+	c := newServer(t)
+	resp, body := c.do("GET", "/v1/nope", nil)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, "not_found", body["error"].(map[string]any)["code"])
+
+	resp, body = c.do("DELETE", "/v1/notifications", nil)
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	assert.Equal(t, "method_not_allowed", body["error"].(map[string]any)["code"])
+	assert.Contains(t, resp.Header.Get("Allow"), "POST")
+}
+
+func TestTimestampsAreUTC(t *testing.T) {
+	c := newServer(t)
+	_, n := c.do("POST", "/v1/notifications", sms("hi"))
+	assert.True(t, strings.HasSuffix(n["createdAt"].(string), "Z"), n["createdAt"])
+}
+
+func TestAPIKeyIsRequiredWhenConfigured(t *testing.T) {
+	c := newServerWith(t, api.Options{APIKeys: []string{"secret-1", "secret-2"}})
+
+	resp, body := c.do("POST", "/v1/notifications", sms("hi"))
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, "unauthorized", body["error"].(map[string]any)["code"])
+
+	resp, _ = c.do("POST", "/v1/notifications", sms("hi"), "Authorization", "Bearer wrong")
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	resp, _ = c.do("POST", "/v1/notifications", sms("hi"), "Authorization", "Bearer secret-2")
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+	resp, _ = c.do("GET", "/v1/notifications", nil, "X-API-Key", "secret-1")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	for _, open := range []string{"/healthz", "/readyz", "/metrics", "/openapi.yaml"} {
+		resp, _ = c.do("GET", open, nil)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, open)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsBase := "ws" + strings.TrimPrefix(c.base, "http") + "/v1/ws"
+	_, _, err := websocket.Dial(ctx, wsBase, nil)
+	assert.Error(t, err)
+	conn, _, err := websocket.Dial(ctx, wsBase+"?apiKey=secret-1", nil)
+	require.NoError(t, err)
+	_ = conn.CloseNow()
+}
+
+func TestWebSocketRejectsForeignBrowserOrigins(t *testing.T) {
+	c := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsURL := "ws" + strings.TrimPrefix(c.base, "http") + "/v1/ws"
+	_, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {"https://evil.example"}}})
+	assert.Error(t, err)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {"http://localhost:3000"}}})
+	require.NoError(t, err)
+	_ = conn.CloseNow()
+}
+
+func TestWebSocketSeesNewNotificationsAsPending(t *testing.T) {
+	c := newServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(c.base, "http")+"/v1/ws", nil)
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseNow() }()
+	time.Sleep(100 * time.Millisecond)
+
+	_, n := c.do("POST", "/v1/notifications", sms("hi"))
+	var ev domain.StatusEvent
+	require.NoError(t, wsjson.Read(ctx, conn, &ev))
+	assert.Equal(t, n["id"], ev.NotificationID.String())
+	assert.Equal(t, domain.StatusPending, ev.Status)
 }
 
 func TestBatchCreateIsAllOrNothing(t *testing.T) {
@@ -347,6 +439,26 @@ func TestNULCharactersAreAValidationErrorNotA500(t *testing.T) {
 	})
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 	assert.ElementsMatch(t, []string{"recipient", "content"}, errorFields(body))
+}
+
+// A batch-level Idempotency-Key makes a retried batch a replay even when
+// the items carry no keys of their own.
+func TestBatchIdempotencyKeyHeader(t *testing.T) {
+	c := newServer(t)
+	req := map[string]any{"notifications": []any{sms("one"), sms("two")}}
+
+	resp, first := c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", "campaign-42")
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	assert.EqualValues(t, 2, first["accepted"])
+
+	resp, again := c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", "campaign-42")
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	assert.EqualValues(t, 0, again["accepted"])
+	assert.EqualValues(t, 2, again["replayed"])
+	assert.Equal(t, first["batchId"], again["batchId"])
+
+	resp, _ = c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", strings.Repeat("k", 124))
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
 func TestResendingAWholeBatchReturnsTheOriginalBatch(t *testing.T) {

@@ -23,6 +23,8 @@ func TestValidateRecipient(t *testing.T) {
 		{"email plain", ChannelEmail, "user@example.com", true},
 		{"email with display name", ChannelEmail, "User <user@example.com>", false},
 		{"email garbage", ChannelEmail, "not-an-email", false},
+		{"email without a dotted domain", ChannelEmail, "a@b", false},
+		{"email domain ends with a dot", ChannelEmail, "a@b.", false},
 		{"push token", ChannelPush, "fcm-token-abcdef123456", true},
 		{"push too short", ChannelPush, "abc", false},
 		{"push whitespace", ChannelPush, "token with spaces", false},

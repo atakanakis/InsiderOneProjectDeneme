@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,13 @@ type Config struct {
 
 	// API
 	HTTPAddr string
+	// APIKeys, when set, are required on every /v1 request (Authorization:
+	// Bearer <key> or X-API-Key; ?apiKey= for the WebSocket). Empty disables
+	// authentication, for local use only.
+	APIKeys []string
+	// WSAllowedOrigins are host patterns browsers may open the WebSocket
+	// from. Non-browser clients send no Origin and are not affected.
+	WSAllowedOrigins []string
 
 	// Worker
 	WorkerMetricsAddr  string
@@ -52,7 +60,9 @@ func Load(serviceName string) (Config, error) {
 		RedisURL:         str("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:         str("LOG_LEVEL", "info"),
 
-		HTTPAddr: str("HTTP_ADDR", ":8080"),
+		HTTPAddr:         str("HTTP_ADDR", ":8080"),
+		APIKeys:          list("API_KEYS", ""),
+		WSAllowedOrigins: list("WS_ALLOWED_ORIGINS", "localhost:*,127.0.0.1:*"),
 
 		WorkerMetricsAddr:  str("WORKER_METRICS_ADDR", ":9091"),
 		ProviderURL:        str("PROVIDER_URL", "http://localhost:9090/send"),
@@ -111,6 +121,17 @@ func str(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// list reads a comma-separated value, ignoring empty items.
+func list(key, def string) []string {
+	var out []string
+	for _, v := range strings.Split(str(key, def), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func integer(key string, def int, errs *[]error) int {

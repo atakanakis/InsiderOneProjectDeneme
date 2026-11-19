@@ -62,6 +62,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, meta RequestMeta) 
 	}
 	if res.Created {
 		observability.NotificationsCreated.WithLabelValues(string(n.Channel), string(n.Priority)).Inc()
+		s.publisher.Publish(ctx, domain.EventFor(res.Notification))
 	}
 	return res.Notification, res.Created, nil
 }
@@ -111,12 +112,21 @@ func (s *Service) CreateBatch(ctx context.Context, inputs []CreateInput, meta Re
 		return BatchResult{}, err
 	}
 	created := 0
+	var events []domain.StatusEvent
 	for _, r := range results {
 		if r.Created {
 			created++
 			observability.NotificationsCreated.WithLabelValues(string(r.Notification.Channel), string(r.Notification.Priority)).Inc()
+			events = append(events, domain.EventFor(r.Notification))
 		}
 	}
+	// Up to 1000 "pending" events: publish them without holding the response.
+	go func() {
+		bg := context.WithoutCancel(ctx)
+		for _, ev := range events {
+			s.publisher.Publish(bg, ev)
+		}
+	}()
 	if created > 0 {
 		return BatchResult{BatchID: &batchID, Items: results}, nil
 	}

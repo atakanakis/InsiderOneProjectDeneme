@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -82,7 +83,10 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns:     s.opts.AllowedOrigins,
+		InsecureSkipVerify: slices.Contains(s.opts.AllowedOrigins, "*"),
+	})
 	if err != nil {
 		return
 	}

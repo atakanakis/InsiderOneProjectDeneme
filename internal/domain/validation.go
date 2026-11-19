@@ -84,7 +84,9 @@ func ValidateRecipient(ch Channel, recipient string, v *ValidationError) {
 		}
 	case ChannelEmail:
 		addr, err := mail.ParseAddress(recipient)
-		if err != nil || addr.Address != recipient {
+		host := recipient[strings.LastIndex(recipient, "@")+1:]
+		if err != nil || addr.Address != recipient ||
+			!strings.Contains(host, ".") || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
 			v.Add("recipient", "must be a plain email address such as user@example.com")
 		}
 	case ChannelPush:
