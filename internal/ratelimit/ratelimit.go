@@ -1,10 +1,25 @@
-// Package ratelimit implements a distributed token bucket in Redis.
+// Package ratelimit implements a distributed sliding-window rate limiter in
+// Redis.
 //
-// Each channel has one bucket shared by every worker process, so the
-// "100 messages per second per channel" limit holds no matter how many
-// workers are running. The whole read-refill-take step runs as one Lua
-// script, which Redis executes atomically, and uses Redis' own clock so
-// workers with skewed clocks cannot cheat.
+// Requirement: at most N messages per second per channel. Each channel has
+// one window shared by every worker process, so the limit holds no matter
+// how many workers run. The check-and-take step is a Lua script, which Redis
+// runs atomically, and it uses Redis' own clock so workers with skewed clocks
+// cannot over-send.
+//
+// Why a sliding window log and not a token bucket: a token bucket with rate
+// R and burst B allows up to R+B sends inside some one-second window (a full
+// bucket plus a second of refill). The requirement is a hard maximum, so we
+// record a timestamp for every permit in a sorted set and only grant a new
+// one while fewer than N permits exist in the last second. Memory is
+// O(N) per channel (100 entries), which is nothing.
+//
+// Safety margin: a permit is taken a few milliseconds before the HTTP
+// request actually leaves (the worker still has to claim the row). If one
+// second's requests leave late and the next second's leave early, the
+// provider could observe slightly more than N in a second. The window is
+// therefore 1s plus a small margin (default 50ms), trading up to ~5% of
+// peak throughput for never exceeding the provider's limit.
 package ratelimit
 
 import (
@@ -12,87 +27,82 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-// Bucket semantics: tokens refill continuously at `rate` per second up to
-// `burst`. Taking n tokens succeeds partially: the caller gets as many as are
-// available right now, plus how long to wait for the next one.
-//
-// Upper bound: any 1-second window can contain at most rate + burst sends
-// (a full bucket plus one second of refill). With burst much smaller than
-// rate the steady state is exactly `rate` per second.
 var takeScript = redis.NewScript(`
 local key = KEYS[1]
-local rate = tonumber(ARGV[1])
-local burst = tonumber(ARGV[2])
+local limit = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
 local requested = tonumber(ARGV[3])
+local token = ARGV[4]
 
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
-local state = redis.call('HMGET', key, 'tokens', 'ts')
-local tokens = tonumber(state[1])
-local ts = tonumber(state[2])
-if tokens == nil then
-  tokens = burst
-  ts = now
+-- Forget permits older than the window: the window is (now - window, now].
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window_ms)
+local used = redis.call('ZCARD', key)
+local granted = math.max(0, math.min(requested, limit - used))
+for i = 1, granted do
+  redis.call('ZADD', key, now, token .. ':' .. i)
 end
+redis.call('PEXPIRE', key, window_ms * 2)
 
-local elapsed = math.max(0, now - ts)
-tokens = math.min(burst, tokens + elapsed * rate / 1000)
-
-local granted = math.min(requested, math.floor(tokens))
-tokens = tokens - granted
-
-redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', now)
-redis.call('PEXPIRE', key, 60000)
-
+-- When short of permits, tell the caller when the oldest one expires.
 local wait_ms = 0
 if granted < requested then
-  wait_ms = math.ceil((1 - (tokens - math.floor(tokens))) * 1000 / rate)
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  if oldest[2] then
+    wait_ms = tonumber(oldest[2]) + window_ms - now
+  end
+  wait_ms = math.max(1, wait_ms)
 end
 return {granted, wait_ms}
 `)
 
-// refundScript gives back tokens that were taken but not used (for example
-// the queue turned out to be empty), so idle polling does not eat capacity.
-var refundScript = redis.NewScript(`
-local key = KEYS[1]
-local burst = tonumber(ARGV[1])
-local n = tonumber(ARGV[2])
-local tokens = tonumber(redis.call('HGET', key, 'tokens'))
-if tokens == nil then return 0 end
-tokens = math.min(burst, tokens + n)
-redis.call('HSET', key, 'tokens', tostring(tokens))
-return 1
-`)
+// Grant is the result of Take. Keep it to Refund permits that went unused.
+type Grant struct {
+	N     int           // permits granted, 0..requested
+	Wait  time.Duration // when N < requested: time until a permit frees up
+	token string
+}
 
 type Limiter struct {
-	rdb   *redis.Client
-	rate  float64
-	burst int
+	rdb    *redis.Client
+	limit  int
+	window time.Duration
 }
 
-func New(rdb *redis.Client, ratePerSecond float64, burst int) *Limiter {
-	return &Limiter{rdb: rdb, rate: ratePerSecond, burst: burst}
+// New allows at most `perSecond` permits per key in any window of one
+// second plus margin.
+func New(rdb *redis.Client, perSecond int, margin time.Duration) *Limiter {
+	return &Limiter{rdb: rdb, limit: perSecond, window: time.Second + margin}
 }
 
-// Take asks for up to n tokens for the given key (one key per channel). It
-// never blocks: it returns how many tokens were granted and, when fewer than
-// requested, roughly how long until the next token is available.
-func (l *Limiter) Take(ctx context.Context, key string, n int) (int, time.Duration, error) {
-	res, err := takeScript.Run(ctx, l.rdb, []string{"ratelimit:" + key}, l.rate, l.burst, n).Int64Slice()
+// Take asks for up to n permits for the given key (one key per channel). It
+// never blocks: it returns how many were granted right now.
+func (l *Limiter) Take(ctx context.Context, key string, n int) (Grant, error) {
+	token := uuid.NewString()
+	res, err := takeScript.Run(ctx, l.rdb, []string{"ratelimit:" + key},
+		l.limit, l.window.Milliseconds(), n, token).Int64Slice()
 	if err != nil {
-		return 0, 0, fmt.Errorf("rate limit script: %w", err)
+		return Grant{}, fmt.Errorf("rate limit script: %w", err)
 	}
-	return int(res[0]), time.Duration(res[1]) * time.Millisecond, nil
+	return Grant{N: int(res[0]), Wait: time.Duration(res[1]) * time.Millisecond, token: token}, nil
 }
 
-// Refund returns n unused tokens to the bucket (never above burst).
-func (l *Limiter) Refund(ctx context.Context, key string, n int) error {
-	if n <= 0 {
+// Refund gives back the last `unused` permits of a grant (for example when
+// the queue turned out to be empty), so idle polling does not eat capacity.
+func (l *Limiter) Refund(ctx context.Context, key string, g Grant, unused int) error {
+	unused = min(unused, g.N)
+	if unused <= 0 {
 		return nil
 	}
-	return refundScript.Run(ctx, l.rdb, []string{"ratelimit:" + key}, l.burst, n).Err()
+	members := make([]any, 0, unused)
+	for i := g.N - unused + 1; i <= g.N; i++ {
+		members = append(members, fmt.Sprintf("%s:%d", g.token, i))
+	}
+	return l.rdb.ZRem(ctx, "ratelimit:"+key, members...).Err()
 }

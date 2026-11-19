@@ -64,7 +64,7 @@ func run() error {
 	st := store.New(pool)
 	engine := delivery.NewEngine(
 		st,
-		ratelimit.New(rdb, cfg.RateLimitPerSecond, cfg.RateLimitBurst),
+		ratelimit.New(rdb, cfg.RateLimitPerSecond, cfg.RateLimitMargin),
 		delivery.NewHTTPProvider(cfg.ProviderURL, cfg.ProviderTimeout),
 		events.NewRedisPublisher(rdb, log),
 		log,

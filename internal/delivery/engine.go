@@ -16,6 +16,7 @@ import (
 	"github.com/atakanakis/notification-engine/internal/domain"
 	"github.com/atakanakis/notification-engine/internal/events"
 	"github.com/atakanakis/notification-engine/internal/observability"
+	"github.com/atakanakis/notification-engine/internal/ratelimit"
 	"github.com/atakanakis/notification-engine/internal/store"
 )
 
@@ -29,8 +30,8 @@ type Queue interface {
 
 // RateLimiter hands out send permits per channel.
 type RateLimiter interface {
-	Take(ctx context.Context, key string, n int) (int, time.Duration, error)
-	Refund(ctx context.Context, key string, n int) error
+	Take(ctx context.Context, key string, n int) (ratelimit.Grant, error)
+	Refund(ctx context.Context, key string, g ratelimit.Grant, unused int) error
 }
 
 type Options struct {
@@ -92,13 +93,13 @@ func (e *Engine) Run(ctx context.Context) {
 //
 //  1. Is there a free concurrency slot?        (otherwise wait for one)
 //  2. Does the circuit breaker allow sending?  (otherwise wait for cool-down)
-//  3. Take rate-limit tokens from Redis.       (otherwise wait for refill)
+//  3. Take rate-limit permits from Redis.      (otherwise wait for the window)
 //  4. Claim that many due rows, highest priority first.
 //  5. Deliver each row in its own goroutine.
 //
-// Tokens are taken before rows are claimed. The other order (claim, then
-// wait for tokens) would hold leased low-priority rows while a high-priority
-// message arriving in the meantime has to wait behind them.
+// Permits are taken before rows are claimed. The other order (claim, then
+// wait for permits) would hold leased low-priority rows while a
+// high-priority message arriving in the meantime has to wait behind them.
 func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 	breaker := e.breakers[ch]
 	slots := make(chan struct{}, e.opts.Concurrency)
@@ -127,7 +128,8 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			continue
 		}
 
-		granted, wait, err := e.limiter.Take(ctx, key, want)
+		grant, err := e.limiter.Take(ctx, key, want)
+		granted := grant.N
 		if err != nil {
 			breaker.Release(want)
 			e.log.Error("rate limiter unavailable", "channel", ch, "error", err)
@@ -137,7 +139,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 		if granted == 0 {
 			breaker.Release(want)
 			observability.RateLimited.WithLabelValues(key).Inc()
-			sleep(ctx, wait)
+			sleep(ctx, grant.Wait)
 			continue
 		}
 		breaker.Release(want - granted)
@@ -145,7 +147,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 		items, err := e.queue.ClaimDue(ctx, ch, granted, e.opts.Lease)
 		if err != nil {
 			breaker.Release(granted)
-			e.refund(ctx, key, granted)
+			e.refund(ctx, key, grant, granted)
 			if ctx.Err() == nil {
 				e.log.Error("claim failed", "channel", ch, "error", err)
 			}
@@ -154,7 +156,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 		}
 		if unused := granted - len(items); unused > 0 {
 			breaker.Release(unused)
-			e.refund(ctx, key, unused)
+			e.refund(ctx, key, grant, unused)
 		}
 
 		for _, n := range items {
@@ -170,8 +172,8 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 	}
 }
 
-func (e *Engine) refund(ctx context.Context, key string, n int) {
-	if err := e.limiter.Refund(context.WithoutCancel(ctx), key, n); err != nil {
+func (e *Engine) refund(ctx context.Context, key string, g ratelimit.Grant, unused int) {
+	if err := e.limiter.Refund(context.WithoutCancel(ctx), key, g, unused); err != nil {
 		e.log.Warn("rate limit refund failed", "channel", key, "error", err)
 	}
 }

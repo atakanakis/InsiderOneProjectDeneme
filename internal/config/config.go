@@ -21,8 +21,8 @@ type Config struct {
 	WorkerMetricsAddr  string
 	ProviderURL        string
 	ProviderTimeout    time.Duration
-	RateLimitPerSecond float64
-	RateLimitBurst     int
+	RateLimitPerSecond int
+	RateLimitMargin    time.Duration
 	WorkerConcurrency  int
 	ClaimBatchSize     int
 	PollInterval       time.Duration
@@ -55,8 +55,8 @@ func Load(serviceName string) (Config, error) {
 		WorkerMetricsAddr:  str("WORKER_METRICS_ADDR", ":9091"),
 		ProviderURL:        str("PROVIDER_URL", "http://localhost:9090/send"),
 		ProviderTimeout:    dur("PROVIDER_TIMEOUT", 5*time.Second, &errs),
-		RateLimitPerSecond: float("RATE_LIMIT_PER_SECOND", 100, &errs),
-		RateLimitBurst:     integer("RATE_LIMIT_BURST", 10, &errs),
+		RateLimitPerSecond: integer("RATE_LIMIT_PER_SECOND", 100, &errs),
+		RateLimitMargin:    dur("RATE_LIMIT_MARGIN", 50*time.Millisecond, &errs),
 		WorkerConcurrency:  integer("WORKER_CONCURRENCY", 50, &errs),
 		ClaimBatchSize:     integer("CLAIM_BATCH_SIZE", 25, &errs),
 		PollInterval:       dur("POLL_INTERVAL", 200*time.Millisecond, &errs),
@@ -73,8 +73,8 @@ func Load(serviceName string) (Config, error) {
 		OTLPEndpoint: str("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		ServiceName:  str("OTEL_SERVICE_NAME", serviceName),
 	}
-	if c.RateLimitPerSecond <= 0 || c.RateLimitBurst < 1 {
-		errs = append(errs, fmt.Errorf("rate limit must be > 0 and burst >= 1"))
+	if c.RateLimitPerSecond < 1 {
+		errs = append(errs, fmt.Errorf("RATE_LIMIT_PER_SECOND must be >= 1"))
 	}
 	if c.MaxAttempts < 1 || c.WorkerConcurrency < 1 || c.ClaimBatchSize < 1 {
 		errs = append(errs, fmt.Errorf("MAX_ATTEMPTS, WORKER_CONCURRENCY and CLAIM_BATCH_SIZE must be >= 1"))
@@ -106,19 +106,6 @@ func integer(key string, def int, errs *[]error) int {
 		return def
 	}
 	return n
-}
-
-func float(key string, def float64, errs *[]error) float64 {
-	v := str(key, "")
-	if v == "" {
-		return def
-	}
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		*errs = append(*errs, fmt.Errorf("%s: %w", key, err))
-		return def
-	}
-	return f
 }
 
 func dur(key string, def time.Duration, errs *[]error) time.Duration {
