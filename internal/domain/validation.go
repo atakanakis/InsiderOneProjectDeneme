@@ -24,6 +24,10 @@ const (
 	MaxIdempotencyKeyLength = 128
 	MaxScheduleAhead        = 30 * 24 * time.Hour
 	MaxBatchSize            = 1000
+	// MaxBatchRenderedBytes caps the content one batch request may produce
+	// through templates. It matches the batch body limit: a batch cannot
+	// create more content via templates than it could have sent inline.
+	MaxBatchRenderedBytes = 16 << 20
 )
 
 // E.164: a plus sign, a non-zero country code digit, up to 15 digits total.

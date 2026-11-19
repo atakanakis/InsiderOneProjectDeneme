@@ -3,8 +3,8 @@ package domain
 import (
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // Templates use a deliberately tiny syntax: {{.name}} (spaces inside the
@@ -15,33 +15,55 @@ import (
 // callers, and text/template gives them printf, range and define: one small
 // request with {{printf "%999999d" 1}} repeated in a template rendered
 // gigabytes before validation could reject it. Plain substitution cannot loop
-// or pad, and Render refuses before allocating anything larger than the
-// caller's limit.
+// or pad. A template is compiled once per request and Render computes the
+// output length from per-variable counts before building anything, so the
+// cost of rejecting an oversized result does not depend on how many
+// placeholders the body has.
 var placeholder = regexp.MustCompile(`\{\{\s*\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}`)
 
-// ParseTemplate checks a template body and returns the variable names it
-// uses, in order of first appearance.
-func ParseTemplate(body string) ([]string, error) {
+// CompiledTemplate is a template body split into literal text and
+// placeholders.
+type CompiledTemplate struct {
+	literals     []string       // len(names)+1 pieces of text around the placeholders
+	names        []string       // placeholder at each position
+	uses         map[string]int // how often each variable appears
+	order        []string       // variable names in order of first appearance
+	literalRunes int
+}
+
+// CompileTemplate checks a template body and prepares it for rendering.
+func CompileTemplate(body string) (*CompiledTemplate, error) {
 	matches := placeholder.FindAllStringSubmatchIndex(body, -1)
-	var names []string
-	seen := map[string]bool{}
+	c := &CompiledTemplate{uses: map[string]int{}}
 	prev := 0
 	for _, m := range matches {
-		if err := checkLiteral(body[prev:m[0]]); err != nil {
+		lit := body[prev:m[0]]
+		if err := checkLiteral(lit); err != nil {
 			return nil, err
 		}
 		name := body[m[2]:m[3]]
-		if !seen[name] {
-			seen[name] = true
-			names = append(names, name)
+		c.literals = append(c.literals, lit)
+		c.names = append(c.names, name)
+		if c.uses[name] == 0 {
+			c.order = append(c.order, name)
 		}
+		c.uses[name]++
 		prev = m[1]
 	}
-	if err := checkLiteral(body[prev:]); err != nil {
+	rest := body[prev:]
+	if err := checkLiteral(rest); err != nil {
 		return nil, err
 	}
-	return names, nil
+	c.literals = append(c.literals, rest)
+	for _, l := range c.literals {
+		c.literalRunes += utf8.RuneCountInString(l)
+	}
+	return c, nil
 }
+
+// Variables returns the variable names the template uses, in order of first
+// appearance.
+func (c *CompiledTemplate) Variables() []string { return c.order }
 
 // checkLiteral rejects braces outside a valid placeholder, so a typo such as
 // "{{.name" or "{{name}}" is reported when the template is created instead
@@ -63,44 +85,51 @@ func snippet(s string) string {
 	return s
 }
 
-// Render fills a template body with variables, e.g. "Hi {{.name}}". It fails
-// if a variable is missing, rather than sending "Hi " to a customer, and if
-// the result would exceed maxBytes. The size is computed before anything is
-// allocated.
-func Render(body string, vars map[string]string, maxBytes int) (string, error) {
-	if _, err := ParseTemplate(body); err != nil {
-		return "", err
-	}
-	matches := placeholder.FindAllStringSubmatchIndex(body, -1)
-
-	size := len(body)
+// RenderedLength is the length in characters (runes) the template would
+// produce with these variables. It fails if a variable is missing, rather
+// than sending "Hi " to a customer. Its cost depends on the number of
+// distinct variables, not on how often they are used.
+func (c *CompiledTemplate) RenderedLength(vars map[string]string) (int, error) {
+	n := c.literalRunes
 	var missing []string
-	for _, m := range matches {
-		name := body[m[2]:m[3]]
+	for _, name := range c.order {
 		v, ok := vars[name]
 		if !ok {
-			if !slices.Contains(missing, name) {
-				missing = append(missing, name)
-			}
+			missing = append(missing, name)
 			continue
 		}
-		size += len(v) - (m[1] - m[0])
+		n += c.uses[name] * utf8.RuneCountInString(v)
 	}
 	if len(missing) > 0 {
-		return "", fmt.Errorf("missing variables: %s", strings.Join(missing, ", "))
+		return 0, fmt.Errorf("missing variables: %s", strings.Join(missing, ", "))
 	}
-	if size > maxBytes {
-		return "", fmt.Errorf("rendered content would exceed %d bytes", maxBytes)
-	}
+	return n, nil
+}
 
-	var b strings.Builder
-	b.Grow(size)
-	prev := 0
-	for _, m := range matches {
-		b.WriteString(body[prev:m[0]])
-		b.WriteString(vars[body[m[2]:m[3]]])
-		prev = m[1]
+// Render fills the template. It refuses, before allocating, any result
+// longer than maxRunes characters.
+func (c *CompiledTemplate) Render(vars map[string]string, maxRunes int) (string, error) {
+	n, err := c.RenderedLength(vars)
+	if err != nil {
+		return "", err
 	}
-	b.WriteString(body[prev:])
+	if n > maxRunes {
+		return "", fmt.Errorf("rendered content would be %d characters, the limit is %d", n, maxRunes)
+	}
+	var b strings.Builder
+	for i, name := range c.names {
+		b.WriteString(c.literals[i])
+		b.WriteString(vars[name])
+	}
+	b.WriteString(c.literals[len(c.literals)-1])
 	return b.String(), nil
+}
+
+// Render compiles body and fills it; for one-off use.
+func Render(body string, vars map[string]string, maxRunes int) (string, error) {
+	c, err := CompileTemplate(body)
+	if err != nil {
+		return "", err
+	}
+	return c.Render(vars, maxRunes)
 }

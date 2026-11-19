@@ -384,6 +384,27 @@ func TestTemplatesAndScheduling(t *testing.T) {
 	assert.Equal(t, []string{"body"}, errorFields(body))
 }
 
+// Regression (review 2): a 96 KB template with 16,000 placeholders and a
+// 1000-item batch made one ~160 KB request cost 665 MB and 8 s. The
+// rendered content of a request is now capped like an inline body.
+func TestTemplateBatchCannotAmplifyIntoGigabytes(t *testing.T) {
+	c := newServer(t)
+	resp, tpl := c.do("POST", "/v1/templates", map[string]any{
+		"name": "wide", "channel": "email", "body": strings.Repeat("{{.a}}", 16_000),
+	})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	items := make([]any, 1000)
+	for i := range items {
+		items[i] = map[string]any{"recipient": "a@b.co", "channel": "email",
+			"templateId": tpl["id"], "variables": map[string]string{"a": "xxxxxx"}}
+	}
+	start := time.Now()
+	resp, body := c.do("POST", "/v1/notifications/batch", map[string]any{"notifications": items})
+	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Contains(t, fmt.Sprint(body), "rendered content exceeds")
+	assert.Less(t, time.Since(start), 3*time.Second)
+}
+
 func TestWebSocketStreamsStatusChanges(t *testing.T) {
 	c := newServer(t)
 	_, n := c.do("POST", "/v1/notifications", sms("hi"))

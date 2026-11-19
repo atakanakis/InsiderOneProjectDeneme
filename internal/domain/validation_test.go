@@ -115,9 +115,9 @@ func TestRender(t *testing.T) {
 }
 
 func TestParseTemplateRejectsAnythingButPlaceholders(t *testing.T) {
-	names, err := ParseTemplate("{{.a}} and {{.b}} and {{.a}}")
+	c, err := CompileTemplate("{{.a}} and {{.b}} and {{.a}}")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"a", "b"}, names)
+	assert.Equal(t, []string{"a", "b"}, c.Variables())
 
 	for _, body := range []string{
 		"Hi {{.name",
@@ -127,7 +127,7 @@ func TestParseTemplateRejectsAnythingButPlaceholders(t *testing.T) {
 		`{{range .x}}loop{{end}}`,
 		`{{define "x"}}{{end}}`,
 	} {
-		_, err := ParseTemplate(body)
+		_, err := CompileTemplate(body)
 		assert.Error(t, err, body)
 	}
 }
@@ -141,9 +141,28 @@ func TestRenderRefusesOversizedOutput(t *testing.T) {
 	big := strings.Repeat("x", 600)
 	_, err = Render("{{.v}}{{.v}}", map[string]string{"v": big}, 1000)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceed 1000 bytes")
+	assert.Contains(t, err.Error(), "1200 characters, the limit is 1000")
 
 	out, err := Render("{{.v}}", map[string]string{"v": big}, 1000)
 	require.NoError(t, err)
 	assert.Len(t, out, 600)
+
+	// The limit is in characters, not bytes.
+	out, err = Render("{{.v}}", map[string]string{"v": strings.Repeat("ş", 1000)}, 1000)
+	require.NoError(t, err)
+	assert.Len(t, out, 2000)
+}
+
+// Regression (review 2): 16,000 placeholders used to be scanned for every
+// item of a batch. Length is now computed from per-variable counts.
+func TestRenderedLengthDoesNotScaleWithPlaceholderCount(t *testing.T) {
+	c, err := CompileTemplate(strings.Repeat("{{.a}}", 16_000))
+	require.NoError(t, err)
+	start := time.Now()
+	for range 1000 {
+		n, err := c.RenderedLength(map[string]string{"a": "xxxxxxx"})
+		require.NoError(t, err)
+		require.Equal(t, 112_000, n)
+	}
+	assert.Less(t, time.Since(start), 100*time.Millisecond)
 }

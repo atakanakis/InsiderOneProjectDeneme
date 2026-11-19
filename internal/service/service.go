@@ -52,7 +52,7 @@ type RequestMeta struct {
 // earlier request with the same idempotency key was returned instead.
 func (s *Service) Create(ctx context.Context, in CreateInput, meta RequestMeta) (domain.Notification, bool, error) {
 	var verr domain.ValidationError
-	n := s.prepare(ctx, in, "", nil, meta, &verr, map[uuid.UUID]*domain.Template{})
+	n := s.prepare(ctx, in, "", nil, meta, &verr, newRenderState())
 	if err := verr.Err(); err != nil {
 		return domain.Notification{}, false, err
 	}
@@ -91,7 +91,7 @@ func (s *Service) CreateBatch(ctx context.Context, inputs []CreateInput, meta Re
 		return BatchResult{}, &verr
 	}
 	batchID := uuid.New()
-	templates := map[uuid.UUID]*domain.Template{}
+	templates := newRenderState()
 	seenKeys := map[string]int{}
 	items := make([]domain.Notification, len(inputs))
 	for i, in := range inputs {
@@ -149,7 +149,7 @@ func commonBatch(results []store.CreateResult) *uuid.UUID {
 // prepare turns client input into a notification ready to insert, recording
 // every validation problem under the given field prefix.
 func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, batchID *uuid.UUID,
-	meta RequestMeta, verr *domain.ValidationError, templates map[uuid.UUID]*domain.Template) domain.Notification {
+	meta RequestMeta, verr *domain.ValidationError, templates *renderState) domain.Notification {
 	field := func(name string) string { return prefix + name }
 	local := domain.ValidationError{}
 	now := s.now()
@@ -183,14 +183,21 @@ func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, ba
 			if channelOK && tpl.Channel != in.Channel {
 				local.Add("templateId", "template is for channel %s, not %s", tpl.Channel, in.Channel)
 			}
-			// UTF-8 needs at most 4 bytes per character, so this cap can
-			// only reject content that ValidateContent would reject too.
-			rendered, err := domain.Render(tpl.Body, in.Variables, 4*domain.MaxContentLength[tpl.Channel])
-			if err != nil {
+			rendered, err := tpl.compiled.Render(in.Variables, domain.MaxContentLength[tpl.Channel])
+			switch {
+			case err != nil:
 				contentKnown = false
 				local.Add("variables", "%v", err)
+			case templates.renderedBytes+len(rendered) > domain.MaxBatchRenderedBytes:
+				// Stop keeping rendered content once over budget, so a
+				// rejected request cannot hold more than the budget in memory.
+				contentKnown = false
+				local.Add("variables", "the request's rendered content exceeds %d MiB; send fewer or shorter notifications per request",
+					domain.MaxBatchRenderedBytes>>20)
+			default:
+				templates.renderedBytes += len(rendered)
+				content = rendered
 			}
-			content = rendered
 		}
 	}
 
@@ -229,16 +236,37 @@ func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, ba
 	}
 }
 
-func (s *Service) template(ctx context.Context, id uuid.UUID, cache map[uuid.UUID]*domain.Template) (*domain.Template, error) {
-	if t, ok := cache[id]; ok {
+// renderState is per request: each template is loaded and compiled once,
+// and the total rendered content is counted against a budget.
+type renderState struct {
+	templates     map[uuid.UUID]*loadedTemplate
+	renderedBytes int
+}
+
+type loadedTemplate struct {
+	domain.Template
+	compiled *domain.CompiledTemplate
+}
+
+func newRenderState() *renderState {
+	return &renderState{templates: map[uuid.UUID]*loadedTemplate{}}
+}
+
+func (s *Service) template(ctx context.Context, id uuid.UUID, rs *renderState) (*loadedTemplate, error) {
+	if t, ok := rs.templates[id]; ok {
 		return t, nil
 	}
 	t, err := s.store.GetTemplate(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	cache[id] = &t
-	return &t, nil
+	c, err := domain.CompileTemplate(t.Body)
+	if err != nil {
+		return nil, fmt.Errorf("stored template is invalid: %w", err)
+	}
+	lt := &loadedTemplate{Template: t, compiled: c}
+	rs.templates[id] = lt
+	return lt, nil
 }
 
 type NotificationDetail struct {
@@ -337,7 +365,7 @@ func (s *Service) CreateTemplate(ctx context.Context, in TemplateInput) (domain.
 	case in.Channel.Valid() && utf8.RuneCountInString(in.Body) > domain.MaxContentLength[in.Channel]:
 		verr.Add("body", "is longer than the %s limit of %d characters", in.Channel, domain.MaxContentLength[in.Channel])
 	default:
-		if _, err := domain.ParseTemplate(in.Body); err != nil {
+		if _, err := domain.CompileTemplate(in.Body); err != nil {
 			verr.Add("body", "is not a valid template: %v", err)
 		}
 	}
