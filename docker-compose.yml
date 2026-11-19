@@ -1,0 +1,119 @@
+# One command: docker compose up --build   (or docker-compose up --build)
+#
+#   API + Swagger UI   http://localhost:8080/docs
+#   Mock provider      http://localhost:9090/stats
+#   Jaeger (traces)    http://localhost:16686
+#   Prometheus         http://localhost:9095
+#
+# To deliver to webhook.site instead of the local mock provider:
+#   PROVIDER_URL=https://webhook.site/<your-uuid> docker compose up --build
+
+name: notification-engine
+
+# Every Go service runs the same image; only `migrate` builds it so the
+# build happens once.
+x-app: &app
+  image: notification-engine:local
+  restart: unless-stopped
+  environment: &env
+    DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: notifications
+      POSTGRES_PASSWORD: notifications
+      POSTGRES_DB: notifications
+    # Not published on the host to avoid clashing with a local Postgres;
+    # use `docker compose exec postgres psql -U notifications` to inspect.
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifications"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *app
+    build: .
+    command: ["/app/migrate"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["/app/api"]
+    ports: ["8080:8080"]
+    environment:
+      <<: *env
+      OTEL_SERVICE_NAME: notification-api
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Two replicas to show that the queue and the rate limit are shared: they
+  # never deliver the same notification twice and together stay within
+  # 100 messages/second per channel.
+  worker:
+    <<: *app
+    command: ["/app/worker"]
+    deploy:
+      replicas: 2
+    environment:
+      <<: *env
+      OTEL_SERVICE_NAME: notification-worker
+      PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:9090/send}
+      RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-100}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      mockprovider: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Stand-in for the external provider with injectable failures.
+  mockprovider:
+    <<: *app
+    command: ["/app/mockprovider"]
+    ports: ["9090:9090"]
+    environment:
+      FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.05}
+      THROTTLE_RATE: ${MOCK_THROTTLE_RATE:-0.02}
+      REJECT_RATE: ${MOCK_REJECT_RATE:-0}
+      LATENCY_MS: ${MOCK_LATENCY_MS:-40}
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes: [./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9095:9090"]
+
+volumes:
+  pgdata:
