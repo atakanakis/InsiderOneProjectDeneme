@@ -34,7 +34,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test (race detector, coverage)
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: go test -race -count=1 -coverpkg=./internal/... -coverprofile=coverage.out ./...
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 

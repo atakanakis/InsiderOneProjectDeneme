@@ -1,6 +1,6 @@
 // Package store is the PostgreSQL persistence layer. PostgreSQL is both the
 // source of truth for notification state and the durable work queue (see
-// docs/adr/0002-postgres-as-queue.md).
+// docs/adr/0001-postgres-as-queue.md).
 package store
 
 import (
