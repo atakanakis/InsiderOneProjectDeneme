@@ -115,7 +115,7 @@ func (s *Store) CreateBatch(ctx context.Context, items []domain.Notification) ([
 		case errors.Is(err, pgx.ErrNoRows):
 			conflicts = append(conflicts, i)
 		default:
-			br.Close()
+			_ = br.Close()
 			return nil, fmt.Errorf("insert batch item %d: %w", i, err)
 		}
 	}

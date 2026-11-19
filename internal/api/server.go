@@ -70,7 +70,7 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	// Outermost first: correlation ID -> panic recovery -> tracing -> access log -> routes.
-	var h http.Handler = accessLog(s.log, mux)
+	h := accessLog(s.log, mux)
 	h = otelhttp.NewHandler(h, "notification-api",
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/metrics" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz"

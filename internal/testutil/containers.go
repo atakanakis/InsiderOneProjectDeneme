@@ -60,7 +60,7 @@ func Main(m *testing.M) {
 	env = &Env{Pool: pool, Redis: redis.NewClient(ropts)}
 	code := m.Run()
 
-	env.Redis.Close()
+	_ = env.Redis.Close()
 	pool.Close()
 	_ = testcontainers.TerminateContainer(pg)
 	_ = testcontainers.TerminateContainer(rc)

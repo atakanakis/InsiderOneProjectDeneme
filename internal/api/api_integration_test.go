@@ -295,7 +295,7 @@ func TestWebSocketStreamsStatusChanges(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(c.base, "http") + "/v1/ws?notificationId=" + id
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	require.NoError(t, err)
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 	time.Sleep(100 * time.Millisecond) // let the hub register the client
 
 	c.do("POST", "/v1/notifications/"+other["id"].(string)+"/cancel", nil) // filtered out
