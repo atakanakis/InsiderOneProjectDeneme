@@ -282,6 +282,14 @@ func TestTemplatesAndScheduling(t *testing.T) {
 	resp, body = c.do("POST", "/v1/templates", map[string]any{"name": "broken", "channel": "sms", "body": "Hi {{.name"})
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 	assert.Equal(t, []string{"body"}, errorFields(body))
+
+	// Regression: template bodies are not code. A printf template used to
+	// let one batch request render gigabytes.
+	resp, body = c.do("POST", "/v1/templates", map[string]any{
+		"name": "pad", "channel": "email", "body": strings.Repeat(`{{printf "%999999d" 1}}`, 10),
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Equal(t, []string{"body"}, errorFields(body))
 }
 
 func TestWebSocketStreamsStatusChanges(t *testing.T) {

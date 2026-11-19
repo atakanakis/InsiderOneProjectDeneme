@@ -227,7 +227,7 @@ paths:
     post:
       tags: [Templates]
       summary: Create a message template
-      description: Bodies use Go template syntax, e.g. `Hi {{.name}}, {{.discount}}% off today!`. Missing variables are rejected at send time.
+      description: "Bodies use `{{.name}}` placeholders and nothing else (no functions, loops or conditionals), e.g. `Hi {{.name}}, {{.discount}}% off today!`. The body may not exceed the channel content limit. Missing variables are rejected when a notification is created."
       operationId: createTemplate
       requestBody:
         required: true

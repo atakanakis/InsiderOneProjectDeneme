@@ -103,14 +103,45 @@ func TestPriorityRankOrdersHighFirst(t *testing.T) {
 }
 
 func TestRender(t *testing.T) {
-	out, err := Render("Hi {{.name}}, {{.discount}}% off!", map[string]string{"name": "Ada", "discount": "20"})
+	out, err := Render("Hi {{.name}}, {{ .discount }}% off!", map[string]string{"name": "Ada", "discount": "20"}, 1000)
 	require.NoError(t, err)
 	assert.Equal(t, "Hi Ada, 20% off!", out)
 
-	_, err = Render("Hi {{.name}}", map[string]string{})
-	require.Error(t, err, "missing variables must not render as <no value>")
-	assert.Contains(t, err.Error(), "name")
+	_, err = Render("Hi {{.name}} {{.city}}", map[string]string{}, 1000)
+	require.Error(t, err, "missing variables must not render as an empty string")
+	assert.Contains(t, err.Error(), "name, city")
+}
 
-	_, err = ParseTemplate("Hi {{.name")
-	assert.Error(t, err)
+func TestParseTemplateRejectsAnythingButPlaceholders(t *testing.T) {
+	names, err := ParseTemplate("{{.a}} and {{.b}} and {{.a}}")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, names)
+
+	for _, body := range []string{
+		"Hi {{.name",
+		"Hi {{name}}",
+		"Hi }} there",
+		`{{printf "%999999d" 1}}`,
+		`{{range .x}}loop{{end}}`,
+		`{{define "x"}}{{end}}`,
+	} {
+		_, err := ParseTemplate(body)
+		assert.Error(t, err, body)
+	}
+}
+
+// Regression: with text/template, {{printf "%999999d" 1}} let one request
+// render gigabytes. Now the output size is checked before allocating.
+func TestRenderRefusesOversizedOutput(t *testing.T) {
+	_, err := Render(`{{printf "%999999d" 1}}`, nil, 1000)
+	require.Error(t, err)
+
+	big := strings.Repeat("x", 600)
+	_, err = Render("{{.v}}{{.v}}", map[string]string{"v": big}, 1000)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceed 1000 bytes")
+
+	out, err := Render("{{.v}}", map[string]string{"v": big}, 1000)
+	require.NoError(t, err)
+	assert.Len(t, out, 600)
 }

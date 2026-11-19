@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -172,7 +173,9 @@ func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, ba
 			if channelOK && tpl.Channel != in.Channel {
 				local.Add("templateId", "template is for channel %s, not %s", tpl.Channel, in.Channel)
 			}
-			rendered, err := domain.Render(tpl.Body, in.Variables)
+			// UTF-8 needs at most 4 bytes per character, so this cap can
+			// only reject content that ValidateContent would reject too.
+			rendered, err := domain.Render(tpl.Body, in.Variables, 4*domain.MaxContentLength[tpl.Channel])
 			if err != nil {
 				contentKnown = false
 				local.Add("variables", "%v", err)
@@ -318,10 +321,15 @@ func (s *Service) CreateTemplate(ctx context.Context, in TemplateInput) (domain.
 	if !in.Channel.Valid() {
 		verr.Add("channel", "must be one of sms, email, push")
 	}
-	if strings.TrimSpace(in.Body) == "" || domain.HasNUL(in.Body) {
+	switch {
+	case strings.TrimSpace(in.Body) == "" || domain.HasNUL(in.Body):
 		verr.Add("body", "is required and must not contain NUL characters")
-	} else if _, err := domain.ParseTemplate(in.Body); err != nil {
-		verr.Add("body", "is not a valid template: %v", err)
+	case in.Channel.Valid() && utf8.RuneCountInString(in.Body) > domain.MaxContentLength[in.Channel]:
+		verr.Add("body", "is longer than the %s limit of %d characters", in.Channel, domain.MaxContentLength[in.Channel])
+	default:
+		if _, err := domain.ParseTemplate(in.Body); err != nil {
+			verr.Add("body", "is not a valid template: %v", err)
+		}
 	}
 	if err := verr.Err(); err != nil {
 		return domain.Template{}, err
