@@ -66,7 +66,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput, meta RequestMeta) 
 }
 
 type BatchResult struct {
-	BatchID uuid.UUID
+	// BatchID groups the notifications this request created. Replayed items
+	// (idempotency key seen before) keep the batch they were created in. If
+	// nothing new was created, BatchID is the original batch when every item
+	// came from the same one (a client re-sending a whole batch), else nil.
+	BatchID *uuid.UUID
 	Items   []store.CreateResult
 }
 
@@ -105,12 +109,30 @@ func (s *Service) CreateBatch(ctx context.Context, inputs []CreateInput, meta Re
 	if err != nil {
 		return BatchResult{}, err
 	}
+	created := 0
 	for _, r := range results {
 		if r.Created {
+			created++
 			observability.NotificationsCreated.WithLabelValues(string(r.Notification.Channel), string(r.Notification.Priority)).Inc()
 		}
 	}
-	return BatchResult{BatchID: batchID, Items: results}, nil
+	if created > 0 {
+		return BatchResult{BatchID: &batchID, Items: results}, nil
+	}
+	return BatchResult{BatchID: commonBatch(results), Items: results}, nil
+}
+
+func commonBatch(results []store.CreateResult) *uuid.UUID {
+	first := results[0].Notification.BatchID
+	if first == nil {
+		return nil
+	}
+	for _, r := range results[1:] {
+		if b := r.Notification.BatchID; b == nil || *b != *first {
+			return nil
+		}
+	}
+	return first
 }
 
 // prepare turns client input into a notification ready to insert, recording
@@ -290,14 +312,14 @@ type TemplateInput struct {
 
 func (s *Service) CreateTemplate(ctx context.Context, in TemplateInput) (domain.Template, error) {
 	var verr domain.ValidationError
-	if n := len(strings.TrimSpace(in.Name)); n == 0 || n > 100 {
-		verr.Add("name", "must be 1-100 characters")
+	if n := len(strings.TrimSpace(in.Name)); n == 0 || n > 100 || domain.HasNUL(in.Name) {
+		verr.Add("name", "must be 1-100 characters without NUL")
 	}
 	if !in.Channel.Valid() {
 		verr.Add("channel", "must be one of sms, email, push")
 	}
-	if strings.TrimSpace(in.Body) == "" {
-		verr.Add("body", "is required")
+	if strings.TrimSpace(in.Body) == "" || domain.HasNUL(in.Body) {
+		verr.Add("body", "is required and must not contain NUL characters")
 	} else if _, err := domain.ParseTemplate(in.Body); err != nil {
 		verr.Add("body", "is not a valid template: %v", err)
 	}

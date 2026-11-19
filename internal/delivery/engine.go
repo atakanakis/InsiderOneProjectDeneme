@@ -144,7 +144,18 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 		}
 		breaker.Release(want - granted)
 
-		items, err := e.queue.ClaimDue(ctx, ch, granted, e.opts.Lease)
+		// The claim must not be cancelled half way: if Postgres commits the
+		// UPDATE but we drop the rows, they sit in "processing" until the
+		// lease expires and may lose their last attempt. Check for shutdown
+		// first, then claim on a context detached from the signal.
+		if ctx.Err() != nil {
+			breaker.Release(granted)
+			e.refund(ctx, key, grant, granted)
+			return
+		}
+		claimCtx, cancelClaim := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		items, err := e.queue.ClaimDue(claimCtx, ch, granted, e.opts.Lease)
+		cancelClaim()
 		if err != nil {
 			breaker.Release(granted)
 			e.refund(ctx, key, grant, granted)

@@ -331,3 +331,56 @@ func TestBatchSummary(t *testing.T) {
 	_, _, err = s.BatchSummary(ctx, uuid.New())
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
+
+func TestIdempotencyMismatchIncludesScheduleAndTemplate(t *testing.T) {
+	s := store.New(testutil.Setup(t).Pool)
+	ctx := context.Background()
+	at := time.Now().Add(time.Hour)
+
+	n := newNotification(domain.ChannelSMS, domain.PriorityNormal)
+	n.IdempotencyKey = ptr("reminder-1")
+	n.ScheduledAt = &at
+	_, err := s.CreateNotification(ctx, n)
+	require.NoError(t, err)
+
+	same := n
+	same.ID = uuid.New()
+	res, err := s.CreateNotification(ctx, same)
+	require.NoError(t, err, "nanosecond vs microsecond precision must still match")
+	assert.False(t, res.Created)
+
+	now := n
+	now.ID = uuid.New()
+	now.ScheduledAt = nil // "send now" instead of "in an hour"
+	_, err = s.CreateNotification(ctx, now)
+	assert.ErrorIs(t, err, store.ErrIdempotencyMismatch)
+}
+
+func TestConcurrentBatchesWithOverlappingKeysDoNotDeadlock(t *testing.T) {
+	s := store.New(testutil.Setup(t).Pool)
+	ctx := context.Background()
+
+	batch := func(keys ...string) []domain.Notification {
+		out := make([]domain.Notification, len(keys))
+		for i, k := range keys {
+			out[i] = newNotification(domain.ChannelSMS, domain.PriorityNormal)
+			out[i].IdempotencyKey = ptr(k)
+		}
+		return out
+	}
+	var wg sync.WaitGroup
+	for i := range 10 {
+		keys := []string{"k1", "k2", "k3", "k4"}
+		if i%2 == 1 {
+			keys = []string{"k4", "k3", "k2", "k1"} // opposite order
+		}
+		wg.Go(func() {
+			_, err := s.CreateBatch(ctx, batch(keys...))
+			assert.NoError(t, err)
+		})
+	}
+	wg.Wait()
+	items, _, err := s.ListNotifications(ctx, store.ListFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, items, 4)
+}

@@ -70,7 +70,7 @@ type batchItem struct {
 }
 
 type batchResponse struct {
-	BatchID  uuid.UUID   `json:"batchId"`
+	BatchID  *uuid.UUID  `json:"batchId"`
 	Accepted int         `json:"accepted"`
 	Replayed int         `json:"replayed"`
 	Items    []batchItem `json:"items"`
@@ -99,7 +99,9 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 			out.Replayed++
 		}
 	}
-	w.Header().Set("Location", "/v1/batches/"+res.BatchID.String())
+	if res.BatchID != nil {
+		w.Header().Set("Location", "/v1/batches/"+res.BatchID.String())
+	}
 	writeJSON(w, http.StatusAccepted, out)
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -100,14 +101,34 @@ func (s *Store) CreateBatch(ctx context.Context, items []domain.Notification) ([
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
 
+	// Insert in idempotency-key order. Two concurrent batches that share keys
+	// then take the unique-index locks in the same order and cannot deadlock
+	// (k1,k2 vs k2,k1 would). Results are mapped back to request order.
+	order := make([]int, len(items))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		ka, kb := items[a].IdempotencyKey, items[b].IdempotencyKey
+		switch {
+		case ka == nil && kb == nil:
+			return 0
+		case ka == nil:
+			return 1
+		case kb == nil:
+			return -1
+		}
+		return strings.Compare(*ka, *kb)
+	})
+
 	batch := &pgx.Batch{}
-	for _, n := range items {
-		batch.Queue(insertSQL, insertArgs(n)...)
+	for _, i := range order {
+		batch.Queue(insertSQL, insertArgs(items[i])...)
 	}
 	results := make([]CreateResult, len(items))
 	conflicts := make([]int, 0)
 	br := tx.SendBatch(ctx, batch)
-	for i := range items {
+	for _, i := range order {
 		created, err := scanNotification(br.QueryRow())
 		switch {
 		case err == nil:
@@ -145,10 +166,26 @@ func (s *Store) resolveConflict(ctx context.Context, q querier, n domain.Notific
 		return domain.Notification{}, fmt.Errorf("load idempotent notification: %w", err)
 	}
 	if existing.Recipient != n.Recipient || existing.Channel != n.Channel ||
-		existing.Content != n.Content || existing.Priority != n.Priority {
+		existing.Content != n.Content || existing.Priority != n.Priority ||
+		!sameTime(existing.ScheduledAt, n.ScheduledAt) || !sameUUID(existing.TemplateID, n.TemplateID) {
 		return domain.Notification{}, ErrIdempotencyMismatch
 	}
 	return existing, nil
+}
+
+// sameTime compares at Postgres' microsecond precision.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Truncate(time.Microsecond).Equal(b.Truncate(time.Microsecond))
+}
+
+func sameUUID(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func (s *Store) GetNotification(ctx context.Context, id uuid.UUID) (domain.Notification, error) {

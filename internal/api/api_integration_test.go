@@ -331,3 +331,31 @@ func TestObservabilityEndpoints(t *testing.T) {
 	resp, _ = c.do("GET", "/openapi.yaml", nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
+
+func TestNULCharactersAreAValidationErrorNotA500(t *testing.T) {
+	c := newServer(t)
+	resp, body := c.do("POST", "/v1/notifications", map[string]any{
+		"recipient": "device-token\x00x", "channel": "push", "content": "a\x00b",
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.ElementsMatch(t, []string{"recipient", "content"}, errorFields(body))
+}
+
+func TestResendingAWholeBatchReturnsTheOriginalBatch(t *testing.T) {
+	c := newServer(t)
+	item := func(key string) map[string]any { m := sms("hi " + key); m["idempotencyKey"] = key; return m }
+	req := map[string]any{"notifications": []any{item("a"), item("b")}}
+
+	resp, first := c.do("POST", "/v1/notifications/batch", req)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+
+	resp, again := c.do("POST", "/v1/notifications/batch", req) // client retry after a timeout
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	assert.Equal(t, first["batchId"], again["batchId"])
+	assert.EqualValues(t, 0, again["accepted"])
+	assert.EqualValues(t, 2, again["replayed"])
+
+	resp, summary := c.do("GET", resp.Header.Get("Location"), nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the advertised batch link works")
+	assert.EqualValues(t, 2, summary["total"])
+}

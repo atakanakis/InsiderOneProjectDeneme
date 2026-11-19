@@ -106,7 +106,9 @@ paths:
         All-or-nothing: every item is validated first; if any item is invalid
         nothing is stored and the errors point at the offending index
         (e.g. `notifications[3].recipient`). Items may carry their own
-        `idempotencyKey`; replayed items are reported with `replayed: true`.
+        `idempotencyKey`; replayed items are reported with `replayed: true` and keep the
+        batch they were originally created in, so re-sending a whole batch after a timeout
+        returns the original `batchId`.
       operationId: createBatch
       parameters:
         - $ref: '#/components/parameters/CorrelationId'
@@ -166,6 +168,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
@@ -182,6 +185,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
@@ -197,6 +201,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/BatchSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/batches/{id}/cancel:
@@ -215,6 +220,7 @@ paths:
                 properties:
                   batchId: { type: string, format: uuid }
                   cancelled: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/templates:
@@ -240,6 +246,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413': { $ref: '#/components/responses/TooLarge' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/ValidationFailed' }
     get:
@@ -268,6 +276,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/metrics:
@@ -284,6 +293,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MetricsSnapshot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   /v1/ws:
     get:
@@ -299,6 +309,7 @@ paths:
         - { name: batchId, in: query, schema: { type: string, format: uuid } }
       responses:
         '101': { description: Switching protocols. }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   /metrics:
     get:
@@ -447,7 +458,14 @@ components:
     BatchCreated:
       type: object
       properties:
-        batchId: { type: string, format: uuid }
+        batchId:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Batch of the notifications created by this request. Replayed items keep their
+            original batch. When every item is a replay, this is the original batch if they
+            all share one (a re-sent batch), otherwise null.
         accepted: { type: integer }
         replayed: { type: integer }
         items:

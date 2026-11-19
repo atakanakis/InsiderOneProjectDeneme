@@ -62,10 +62,19 @@ func (e *ValidationError) Err() error {
 	return e
 }
 
+// HasNUL reports whether s contains a NUL byte. JSON allows "\u0000" but
+// PostgreSQL TEXT does not, so it must be rejected as a 422 here instead of
+// surfacing as a 500 from the insert.
+func HasNUL(s string) bool { return strings.ContainsRune(s, 0) }
+
 // ValidateRecipient checks the recipient format for the given channel.
 func ValidateRecipient(ch Channel, recipient string, v *ValidationError) {
 	if strings.TrimSpace(recipient) == "" {
 		v.Add("recipient", "is required")
+		return
+	}
+	if HasNUL(recipient) {
+		v.Add("recipient", "must not contain NUL characters")
 		return
 	}
 	switch ch {
@@ -100,6 +109,9 @@ func ValidateContent(ch Channel, content string, v *ValidationError) {
 	if !utf8.ValidString(content) {
 		v.Add("content", "must be valid UTF-8")
 	}
+	if HasNUL(content) {
+		v.Add("content", "must not contain NUL characters")
+	}
 }
 
 // ValidateSchedule rejects schedules too far in the future. A time in the
@@ -117,7 +129,7 @@ func ValidateIdempotencyKey(key *string, v *ValidationError) {
 	if key == nil {
 		return
 	}
-	if *key == "" || len(*key) > MaxIdempotencyKeyLength {
-		v.Add("idempotencyKey", "must be 1-%d characters", MaxIdempotencyKeyLength)
+	if *key == "" || len(*key) > MaxIdempotencyKeyLength || HasNUL(*key) {
+		v.Add("idempotencyKey", "must be 1-%d characters without NUL", MaxIdempotencyKeyLength)
 	}
 }

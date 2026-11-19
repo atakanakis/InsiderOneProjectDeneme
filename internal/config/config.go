@@ -79,6 +79,21 @@ func Load(serviceName string) (Config, error) {
 	if c.MaxAttempts < 1 || c.WorkerConcurrency < 1 || c.ClaimBatchSize < 1 {
 		errs = append(errs, fmt.Errorf("MAX_ATTEMPTS, WORKER_CONCURRENCY and CLAIM_BATCH_SIZE must be >= 1"))
 	}
+	for name, d := range map[string]time.Duration{
+		"PROVIDER_TIMEOUT": c.ProviderTimeout, "POLL_INTERVAL": c.PollInterval,
+		"LEASE_DURATION": c.LeaseDuration, "REAP_INTERVAL": c.ReapInterval,
+		"RETRY_BASE_DELAY": c.RetryBaseDelay, "BREAKER_OPEN_DURATION": c.BreakerOpenDuration,
+	} {
+		if d <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be > 0", name))
+		}
+	}
+	if c.RetryMaxDelay < c.RetryBaseDelay {
+		errs = append(errs, fmt.Errorf("RETRY_MAX_DELAY must be >= RETRY_BASE_DELAY"))
+	}
+	if c.BreakerFailureThreshold < 1 {
+		errs = append(errs, fmt.Errorf("BREAKER_FAILURE_THRESHOLD must be >= 1"))
+	}
 	if c.LeaseDuration <= c.ProviderTimeout {
 		errs = append(errs, fmt.Errorf("LEASE_DURATION (%s) must exceed PROVIDER_TIMEOUT (%s)", c.LeaseDuration, c.ProviderTimeout))
 	}
