@@ -39,10 +39,17 @@ func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 // Connect opens a connection pool and retries for a while, because in
 // docker-compose the database may still be starting when we boot.
-func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
+//
+// maxConns sizes the pool (0 keeps pgx's default of max(4, CPUs), which is
+// far below what a worker with dozens of concurrent deliveries needs; every
+// delivery records its result in its own short transaction).
+func Connect(ctx context.Context, url string, maxConns int) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if maxConns > 0 {
+		cfg.MaxConns = int32(min(maxConns, 1000))
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

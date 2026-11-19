@@ -10,9 +10,10 @@ import (
 )
 
 type Config struct {
-	DatabaseURL string
-	RedisURL    string
-	LogLevel    string
+	DatabaseURL      string
+	DatabaseMaxConns int
+	RedisURL         string
+	LogLevel         string
 
 	// API
 	HTTPAddr string
@@ -46,9 +47,10 @@ type Config struct {
 func Load(serviceName string) (Config, error) {
 	var errs []error
 	c := Config{
-		DatabaseURL: str("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
-		RedisURL:    str("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:    str("LOG_LEVEL", "info"),
+		DatabaseURL:      str("DATABASE_URL", "postgres://notifications:notifications@localhost:5432/notifications?sslmode=disable"),
+		DatabaseMaxConns: integer("DATABASE_MAX_CONNS", 20, &errs),
+		RedisURL:         str("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:         str("LOG_LEVEL", "info"),
 
 		HTTPAddr: str("HTTP_ADDR", ":8080"),
 
@@ -76,13 +78,14 @@ func Load(serviceName string) (Config, error) {
 	if c.RateLimitPerSecond < 1 {
 		errs = append(errs, fmt.Errorf("RATE_LIMIT_PER_SECOND must be >= 1"))
 	}
-	if c.MaxAttempts < 1 || c.WorkerConcurrency < 1 || c.ClaimBatchSize < 1 {
-		errs = append(errs, fmt.Errorf("MAX_ATTEMPTS, WORKER_CONCURRENCY and CLAIM_BATCH_SIZE must be >= 1"))
+	if c.MaxAttempts < 1 || c.WorkerConcurrency < 1 || c.ClaimBatchSize < 1 || c.DatabaseMaxConns < 1 {
+		errs = append(errs, fmt.Errorf("MAX_ATTEMPTS, WORKER_CONCURRENCY, CLAIM_BATCH_SIZE and DATABASE_MAX_CONNS must be >= 1"))
 	}
 	for name, d := range map[string]time.Duration{
 		"PROVIDER_TIMEOUT": c.ProviderTimeout, "POLL_INTERVAL": c.PollInterval,
 		"LEASE_DURATION": c.LeaseDuration, "REAP_INTERVAL": c.ReapInterval,
 		"RETRY_BASE_DELAY": c.RetryBaseDelay, "BREAKER_OPEN_DURATION": c.BreakerOpenDuration,
+		"RATE_LIMIT_MARGIN": c.RateLimitMargin,
 	} {
 		if d <= 0 {
 			errs = append(errs, fmt.Errorf("%s must be > 0", name))

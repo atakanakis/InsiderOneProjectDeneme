@@ -48,7 +48,7 @@ func Main(m *testing.M) {
 
 	dsn, err := pg.ConnectionString(ctx, "sslmode=disable")
 	exitOn(err, "postgres dsn")
-	pool, err := store.Connect(ctx, dsn)
+	pool, err := store.Connect(ctx, dsn, 20)
 	exitOn(err, "connect postgres")
 	exitOn(store.Migrate(ctx, pool), "migrate")
 

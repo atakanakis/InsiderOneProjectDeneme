@@ -18,6 +18,7 @@ import (
 
 	"github.com/atakanakis/notification-engine/internal/config"
 	"github.com/atakanakis/notification-engine/internal/delivery"
+	"github.com/atakanakis/notification-engine/internal/domain"
 	"github.com/atakanakis/notification-engine/internal/events"
 	"github.com/atakanakis/notification-engine/internal/observability"
 	"github.com/atakanakis/notification-engine/internal/ratelimit"
@@ -48,7 +49,7 @@ func run() error {
 	}
 	defer shutdownTracing(context.Background()) //nolint:errcheck
 
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.Connect(ctx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
 	if err != nil {
 		return err
 	}
@@ -65,7 +66,7 @@ func run() error {
 	engine := delivery.NewEngine(
 		st,
 		ratelimit.New(rdb, cfg.RateLimitPerSecond, cfg.RateLimitMargin),
-		delivery.NewHTTPProvider(cfg.ProviderURL, cfg.ProviderTimeout),
+		delivery.NewHTTPProvider(cfg.ProviderURL, cfg.ProviderTimeout, cfg.WorkerConcurrency*len(domain.Channels)),
 		events.NewRedisPublisher(rdb, log),
 		log,
 		delivery.Options{
@@ -77,6 +78,7 @@ func run() error {
 			Retry:            delivery.RetryPolicy{BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay},
 			BreakerThreshold: cfg.BreakerFailureThreshold,
 			BreakerOpenFor:   cfg.BreakerOpenDuration,
+			PermitMaxAge:     cfg.RateLimitMargin,
 		},
 	)
 

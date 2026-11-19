@@ -23,7 +23,7 @@ func TestHTTPProviderSendsContractAndParsesResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res := NewHTTPProvider(srv.URL, time.Second).Send(context.Background(), Message{
+	res := NewHTTPProvider(srv.URL, time.Second, 4).Send(context.Background(), Message{
 		NotificationID: "n-1", CorrelationID: "c-1", To: "+905551234567", Channel: "sms", Content: "hi",
 	})
 
@@ -43,7 +43,7 @@ func TestHTTPProviderReportsRetryAfterAndBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res := NewHTTPProvider(srv.URL, time.Second).Send(context.Background(), Message{NotificationID: "n"})
+	res := NewHTTPProvider(srv.URL, time.Second, 4).Send(context.Background(), Message{NotificationID: "n"})
 	assert.Equal(t, http.StatusTooManyRequests, res.StatusCode)
 	assert.Equal(t, 7*time.Second, res.RetryAfter)
 	assert.Contains(t, describeFailure(res), "HTTP 429: slow down")
@@ -58,7 +58,7 @@ func TestHTTPProviderTimeoutIsATransportError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res := NewHTTPProvider(srv.URL, 50*time.Millisecond).Send(context.Background(), Message{NotificationID: "n"})
+	res := NewHTTPProvider(srv.URL, 50*time.Millisecond, 4).Send(context.Background(), Message{NotificationID: "n"})
 	require.Error(t, res.Err)
 	assert.Equal(t, "retryable", string(Classify(res)))
 }
@@ -70,7 +70,7 @@ func TestHTTPProviderToleratesUnparseableSuccessBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res := NewHTTPProvider(srv.URL, time.Second).Send(context.Background(), Message{NotificationID: "n"})
+	res := NewHTTPProvider(srv.URL, time.Second, 4).Send(context.Background(), Message{NotificationID: "n"})
 	assert.Equal(t, "delivered", string(Classify(res)), "the provider accepted it; the ID is optional")
 	assert.Empty(t, res.MessageID)
 }

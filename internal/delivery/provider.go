@@ -46,12 +46,20 @@ type HTTPProvider struct {
 	client *http.Client
 }
 
-func NewHTTPProvider(url string, timeout time.Duration) *HTTPProvider {
+// NewHTTPProvider builds a client that keeps up to maxConns idle connections
+// to the provider. http.DefaultTransport keeps only 2 per host, so with
+// dozens of concurrent sends most requests would open a new TCP and TLS
+// connection, adding latency between taking a rate-limit permit and the
+// request arriving.
+func NewHTTPProvider(url string, timeout time.Duration, maxConns int) *HTTPProvider {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = max(maxConns, 2)
+	tr.MaxIdleConnsPerHost = max(maxConns, 2)
 	return &HTTPProvider{
 		url: url,
 		client: &http.Client{
 			Timeout:   timeout,
-			Transport: otelhttp.NewTransport(http.DefaultTransport),
+			Transport: otelhttp.NewTransport(tr),
 		},
 	}
 }

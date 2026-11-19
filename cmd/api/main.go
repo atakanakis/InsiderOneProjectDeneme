@@ -45,7 +45,7 @@ func run() error {
 	}
 	defer shutdownTracing(context.Background()) //nolint:errcheck
 
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.Connect(ctx, cfg.DatabaseURL, cfg.DatabaseMaxConns)
 	if err != nil {
 		return err
 	}

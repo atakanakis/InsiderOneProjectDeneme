@@ -20,7 +20,7 @@ func main() {
 	}
 	log := observability.NewLogger(cfg.ServiceName, cfg.LogLevel)
 	ctx := context.Background()
-	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	pool, err := store.Connect(ctx, cfg.DatabaseURL, 2)
 	if err != nil {
 		log.Error("connect", "error", err)
 		os.Exit(1)
