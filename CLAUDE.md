@@ -46,10 +46,17 @@ make load                        # burst test against the running stack
 5. **Migrations are append-only.** Never edit an applied migration; add a new numbered file.
 6. **API changes update `api/openapi.yaml`** and the integration tests in `internal/api`.
 7. **Redis key layouts are versioned** (`ratelimit:v2:`); bump the version when changing them.
-8. **A claim is all or nothing** (one transaction), and claimed rows that will not be sent are
-   handed back with `ReleaseClaims` (attempt refunded), never left for the reaper.
+8. **A claim never strands rows.** Each priority is claimed under a savepoint in one
+   transaction; rows it returns must be delivered even when it also returns an error. Claimed
+   rows that will not be sent are handed back with `ReleaseClaims` (attempt refunded), never
+   left for the reaper. The claim's `ORDER BY` must match the dispatch index exactly.
 9. **Fixes get an injected-failure test**, not only a test of the reported case. Independent
    reviews and their resolutions are recorded in `docs/reviews/`.
+10. **Fix the class, not the reproduction.** Anything a request can make the server allocate
+    or return is bounded: rendered content, validation errors (`MaxFieldErrors`), list
+    endpoints (paged, no large fields). A new endpoint or error path needs its bound stated.
+11. **A rate-limit permit is checked where the request leaves** (`WithSendGate`, at
+    connection-ready), not only where the send was started.
 
 ## Conventions
 

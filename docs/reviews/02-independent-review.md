@@ -52,6 +52,9 @@ Two of the three major findings were **inside the review 1 fix commits**. The cl
 came from a performance fix that changed one statement into three. The template fix closed
 the reported attack but not the dimension next to it: per item rather than per batch. A fix is
 new code written to satisfy one reproduction, so it deserves the hardest look in the next
-round. That is now a rule in the reviewer definition. Every fix in this round was also
+round. That is now a rule in the reviewer definition. The major fixes in this round were also
 checked against an injected failure (a trigger, a failing write, a stall) and not only against
 the original reproduction.
+
+*Correction after review 3:* an earlier version of this paragraph said "every fix". Items 5 to
+7 had no engine-level test until review 3 pointed it out; the tests were added then.

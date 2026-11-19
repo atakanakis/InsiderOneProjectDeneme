@@ -35,6 +35,12 @@ is to find what is wrong, missing or overstated, and to prove it.
   code written to satisfy one reproduction. Check the dimension next to the one that was fixed
   (per batch, not just per item), and whether the fix gave up an earlier guarantee (atomicity,
   ordering, an attempt budget).
+- When a finding is an instance of a class (unbounded output, a guarantee measured in the
+  wrong place), name the class and look for its other instances, including error paths and
+  list endpoints. Check a guarantee where its effect happens (at the provider, on the wire),
+  with no fault injected as well as with faults.
+- The earlier review records are claims too. Verify statements such as "each fix has a test"
+  against the repository.
 - Prefer findings specific to this code over generic best practices.
 
 ## Report

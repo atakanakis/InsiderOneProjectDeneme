@@ -183,6 +183,11 @@ an external HTTP API is impossible: if the provider accepts a message and the re
 choice for a notification system, so every provider call carries
 `Idempotency-Key: <notification id>`, which is stable across retries, and a provider that
 honours it (the mock provider does) drops the duplicate. [ADR 0004](docs/adr/0004-at-least-once-delivery.md).
+To be plain about the cost: if a worker is killed outright (`kill -9`, OOM), every message it
+had in flight is sent again after its lease expires, and a provider that ignores
+`Idempotency-Key` (webhook.site does) delivers those twice. A reviewer killed a worker
+mid-burst and counted 100 such duplicates. `WORKER_CONCURRENCY` is the upper bound of that
+exposure per channel; graceful shutdown and failed result writes do not cause duplicates.
 
 **Time.** Every queue timestamp (`next_attempt_at`, leases, backoff) is computed with
 PostgreSQL's clock, and the rate limiter uses Redis' clock. Host clocks never decide whether
@@ -207,9 +212,15 @@ something is due. (The integration tests caught a real skew bug here; see
   claimed rows only as fresh permits arrive (`notification_stale_permits_total` counts this).
   `TestRateLimitHoldsWhenClaimsStall` and a live run with five 0.6s Postgres pauses both
   measure exactly the limit; without this, a reviewer measured 150 at a limit of 100.
-- What the margin cannot cover is network jitter after the request leaves the worker; the
-  provider transport keeps warm connections so most requests do not wait on a TCP/TLS
-  handshake.
+- Connection setup is covered too. A TCP/TLS handshake can take far longer than the margin,
+  and on the first burst after idle every request waits for one while the next second's
+  requests reuse warm connections, so both bursts would land in the same second (a reviewer
+  measured 200 at a limit of 100 through a proxy that delayed new connections). The permit
+  is therefore checked again when the connection is ready, immediately before the request
+  is written, and re-taken if it is stale (`TestRateLimitHoldsOnColdConnections`).
+- What remains outside the worker's control: network jitter after the request is written,
+  and Redis losing its state (see [ADR 0002](docs/adr/0002-sliding-window-rate-limit.md)).
+  The limit is strict against everything the worker can observe, not against the network.
 
 **Urgent work is never stuck behind a backlog.** Each worker runs one dispatcher per channel:
 
@@ -292,10 +303,13 @@ The integration tests run against real infrastructure because the interesting bu
 | `TestLateSuccessWinsUntilTheRowIsClaimedAgain` | a delivered message is not sent again because its result came late |
 | `TestRateLimitHoldsAcrossTwoWorkers` | two engines together never exceed the limit in any sliding second |
 | `TestRateLimitHoldsWhenClaimsStall` | the limit holds when claims stall for 0.4-0.6s |
+| `TestRateLimitHoldsOnColdConnections` | the limit holds when every new connection takes 150 ms to set up |
 | `TestFutureHighPriorityBacklogDoesNotBlockDueRows` | a scheduled campaign does not hide due work |
-| `TestClaimIsAllOrNothing` | a failure inside a claim (injected with a trigger) spends no attempts |
+| `TestClaimDoesNotSortTiedBacklog` | the claim reads 50k rows sharing one timestamp in index order (checks the query plan) |
+| `TestFailingPriorityNeitherStrandsNorBlocksOthers` | a failure inside a claim (injected with a trigger) strands nothing and blocks no other priority |
+| `TestRowsWithoutFreshPermitsAreReleasedNotSpent`, `TestShutdownWhileWaitingForPermitsIsPrompt` | claimed rows that cannot be sent go back with their attempt refunded |
 | `TestFailedResultWriteIsRetriedNotResent` | a failed database write after a successful send does not cause a second send |
-| `TestTemplateBatchCannotAmplifyIntoGigabytes` | a small request cannot render unbounded content through templates |
+| `TestTemplateBatchCannotAmplifyIntoGigabytes`, `TestValidationResponseStaysSmall` | a small request cannot buy unbounded memory or an unbounded response |
 | `TestHighPriorityOvertakesBacklog` | a high-priority message queued last is delivered first |
 | `TestCircuitBreakerPreservesAttemptsDuringOutage` | an outage does not burn every message's retries |
 | `TestTransientFailuresAreRetriedUntilDelivered` / `TestGivesUpAfterMaxAttempts` / `TestPermanentFailureIsNotRetried` | the retry policy end to end |
@@ -382,5 +396,6 @@ the reviewer.
 
 About the history: the commits up to `docs: README, ADRs, AI workflow and agent context` were
 cut into logical steps from a working tree in build order, so their timestamps cluster and do
-not show how long each step took. The commits after it were made one fix at a time, in the
-order the work was done; some are seconds apart because one change was committed as two.
+not show how long each step took. After each review, that round's fixes were written and
+tested in one working session and committed in logical groups, so their timestamps show when
+a group was committed, not how long it took.

@@ -46,6 +46,14 @@ run with five 0.6s pauses (100 at 100). The alternative, taking a permit per mes
 before each HTTP call, would also work but costs one Redis round trip per message instead of
 per claim.
 
+**Second amendment (review 3).** The check above ended when the delivery goroutine started,
+so connection setup was still uncovered: through a proxy that delayed new connections by
+120 ms, a burst from idle produced 200 at a limit of 100. The permit's age is now checked
+again inside the HTTP client when a connection is ready (`httptrace.GotConn`), immediately
+before the request is written, and a fresh single permit is taken if it is stale. The stale
+permit is not refunded, so a cold start costs up to one window of throughput; that is the
+price of not exceeding the limit.
+
 ## Consequences
 
 - Strict and simple to reason about; one Redis round trip per dispatcher loop.

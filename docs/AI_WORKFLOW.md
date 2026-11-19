@@ -86,13 +86,18 @@ main session ──spawn──▶ reviewer agent (cold: requirements + repo only
 | 1 | Different model (Fable), cold context, failure injection | Found two major problems the earlier passes missed, plus ten smaller ones. Template rendering let one request allocate 2.9 GB. The rate limit was exceeded after a 0.6s database pause (150 at a limit of 100). Details, evidence and the fixing commit for each: [`docs/reviews/01-independent-review.md`](reviews/01-independent-review.md). |
 | 2 | A new Fable instance, given only the written record of round 1 | Verified each round 1 fix with its own fault injection: the stall fix held under every pattern it tried. It then found that two round 1 fixes had problems of their own. The template fix closed the attack per item but not per batch, and the claim fix had given up atomicity. It also found a duplicate send after one failed result write. All were fixed, each with an injected-failure test: [`docs/reviews/02-independent-review.md`](reviews/02-independent-review.md). |
 
-Rounds 1 and 2 also improved the process itself. The template problem sat in a feature that round 0
+| 3 | Another new Fable instance, given both written records | Confirmed the stall, late-success and atomicity fixes under harder faults (a 36s database pause, `kill -9`). It then found the limit exceeded on cold connections with no fault at all, a third variant of the amplification problem (on the error path), and a claim query that sorted tied rows. It also caught our own review record overstating its test coverage. [`docs/reviews/03-independent-review.md`](reviews/03-independent-review.md). |
+
+Each round also improved the process itself. The template problem sat in a feature that round 0
 had passed, because round 0 checked correctness and not abuse. The rate-limit problem broke a
 claim the README made confidently, because our load test never paused the database. Both
 lessons are now rules in the reviewer definition. Round 2 added a third: two of its three
 major findings were inside round 1's fix commits, so the reviewer now treats fix commits as
 its first suspects, and every fix is tested against an injected failure, not only against the
-reproduction that prompted it.
+reproduction that prompted it. Round 3 added the most important one: the same problem class
+came back three times because each fix addressed one reproduction. The rule now is to fix the
+class, state the invariant and write it into `CLAUDE.md`, and the written review records are
+themselves treated as claims that the next reviewer verifies.
 
 None of the first five defects would have been caught by unit tests with mocks, and all five would have shipped
 if "the code compiles and the agent says it works" were the bar. The two major findings of round 1 would
