@@ -69,6 +69,11 @@ type Grant struct {
 	token string
 }
 
+// keyPrefix is versioned: an older build used a token bucket stored as a
+// hash under "ratelimit:<channel>", and a rolling deploy must not feed that
+// key to this script (WRONGTYPE). Bump the version when the layout changes.
+const keyPrefix = "ratelimit:v2:"
+
 type Limiter struct {
 	rdb    *redis.Client
 	limit  int
@@ -85,7 +90,7 @@ func New(rdb *redis.Client, perSecond int, margin time.Duration) *Limiter {
 // never blocks: it returns how many were granted right now.
 func (l *Limiter) Take(ctx context.Context, key string, n int) (Grant, error) {
 	token := uuid.NewString()
-	res, err := takeScript.Run(ctx, l.rdb, []string{"ratelimit:" + key},
+	res, err := takeScript.Run(ctx, l.rdb, []string{keyPrefix + key},
 		l.limit, l.window.Milliseconds(), n, token).Int64Slice()
 	if err != nil {
 		return Grant{}, fmt.Errorf("rate limit script: %w", err)
@@ -104,5 +109,5 @@ func (l *Limiter) Refund(ctx context.Context, key string, g Grant, unused int) e
 	for i := g.N - unused + 1; i <= g.N; i++ {
 		members = append(members, fmt.Sprintf("%s:%d", g.token, i))
 	}
-	return l.rdb.ZRem(ctx, "ratelimit:"+key, members...).Err()
+	return l.rdb.ZRem(ctx, keyPrefix+key, members...).Err()
 }
