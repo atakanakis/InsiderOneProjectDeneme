@@ -35,6 +35,17 @@ The window is therefore `1s + RATE_LIMIT_MARGIN` (50 ms): at most ~5% lower peak
 but the limit now holds as the provider measures it (max 50/50 and 100/100 in tests and load
 runs).
 
+**Amendment (after independent review).** The margin only covers the *usual* gap between
+permit and send. A reviewer paused the Postgres container for 0.6s during a burst and the
+provider saw 150 requests in one second: the claim returned late, and the permits it carried
+had been stamped before the pause. The dispatcher now measures how long Take plus the claim
+took; if longer than the margin (`PermitMaxAge`), it refunds those permits and sends the
+claimed rows only as fresh permits arrive. `TestRateLimitHoldsWhenClaimsStall` reproduces the
+overshoot without this (75 at 50) and measures exactly the limit with it, as did a live load
+run with five 0.6s pauses (100 at 100). The alternative, taking a permit per message right
+before each HTTP call, would also work but costs one Redis round trip per message instead of
+per claim.
+
 ## Consequences
 
 - Strict and simple to reason about; one Redis round trip per dispatcher loop.

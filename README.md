@@ -172,8 +172,10 @@ shows 7 of 10 messages untouched during an outage.
 **5. Survive crashes.** Claiming a row sets `locked_until` (a lease). If a worker dies
 mid-delivery, a reaper returns expired rows to `retrying` (or `failed` if no attempts are
 left). A late result from a worker whose lease expired is rejected (`attempts = $n` guard), so
-it can never overwrite the newer owner's state. On SIGTERM a worker stops claiming and drains
-in-flight deliveries before exiting.
+it can never overwrite the newer owner's state. The one exception is a late **success** on a
+row nobody has claimed again: the message was delivered, so it wins instead of causing a
+duplicate send. On SIGTERM a worker stops claiming and drains in-flight deliveries before
+exiting.
 
 **6. Delivery guarantee: at-least-once, with duplicate suppression.** Exactly-once delivery to
 an external HTTP API is impossible: if the provider accepts a message and the response is lost
@@ -200,27 +202,45 @@ something is due. (The integration tests caught a real skew bug here; see
 - A permit is taken a few milliseconds before the request leaves (the worker still claims the
   row), so the window is 1s + `RATE_LIMIT_MARGIN` (50ms). That keeps the limit true **as the
   provider sees it**, at the cost of up to ~5% peak throughput.
+- If taking permits plus claiming rows took longer than the margin (a database pause, GC,
+  failover), the permits no longer cover a send now. The dispatcher refunds them and sends the
+  claimed rows only as fresh permits arrive (`notification_stale_permits_total` counts this).
+  `TestRateLimitHoldsWhenClaimsStall` and a live run with five 0.6s Postgres pauses both
+  measure exactly the limit; without this, a reviewer measured 150 at a limit of 100.
+- What the margin cannot cover is network jitter after the request leaves the worker; the
+  provider transport keeps warm connections so most requests do not wait on a TCP/TLS
+  handshake.
 
-**Priority without starvation of urgent work.** Each worker runs one dispatcher per channel:
+**Urgent work is never stuck behind a backlog.** Each worker runs one dispatcher per channel:
 
 1. free concurrency slot? 2. breaker allows? 3. **take permits** from Redis
-4. **claim** that many due rows `ORDER BY priority, next_attempt_at` with
-   `FOR UPDATE SKIP LOCKED` 5. deliver each in a goroutine.
+4. **claim** that many due rows, high priority first, then normal, then low (one indexed
+   range query per priority, oldest first within each), with `FOR UPDATE SKIP LOCKED`
+5. deliver each in a goroutine.
 
 Permits are taken **before** rows are claimed. The other order (claim, then wait for a permit)
 would hold leased low-priority rows while a high-priority message arriving meanwhile waits
 behind them. Unused permits are refunded. Channels are independent, so an email backlog never
 slows SMS.
 
-**Measured** (`make load`, 2 workers, 5% injected 503s and 2% 429s, 2000-SMS burst): the
-provider never received more than **100 requests in any second**, every message was delivered,
-and a high-priority SMS queued *after* the 2000 was sent within **2 seconds**, while fewer
-than 10% of the backlog had been processed. Total time (~31s) is dominated by the retry
-backoff of the ~150 injected failures.
+Priority is **strict**: while high-priority traffic alone fills the channel's 100/s, normal
+and low wait. That is deliberate (an OTP must not queue behind a campaign), but it means
+sustained high-priority overload starves the rest. If that became a real pattern, the fix is
+a reserved share per claim (e.g. 10% of each claim for the oldest lower-priority rows) or
+promoting rows older than a threshold.
+
+**Measured** (`make load`, 2 workers, 5% injected 503s and 2% 429s, 2000-SMS burst, plus five
+0.6s `docker compose pause postgres` stalls during the run): the provider never received more
+than **100 requests in any sliding one-second window**, every message was delivered, and a
+high-priority SMS queued *after* the 2000 was sent within **0.7 seconds**, while fewer than 5%
+of the backlog had been processed. Total time (~33s) is dominated by the retry backoff of the
+~170 injected failures.
 
 ## Idempotency
 
-- Clients send `Idempotency-Key` (header) or `idempotencyKey` (body, per batch item).
+- Clients send `Idempotency-Key` (header) or `idempotencyKey` (body, per batch item). On the
+  batch endpoint the header covers the whole batch: items without their own key get
+  `<header>:<index>`, so re-sending a batch after a timeout replays it.
 - A `UNIQUE` index plus `INSERT ... ON CONFLICT DO NOTHING` makes this race-free: 20
   simultaneous requests with one key create one row (`TestConcurrentIdempotentCreatesYieldOneRow`).
 - A replay returns the original notification with `200` and `Idempotent-Replayed: true`.
@@ -266,7 +286,10 @@ The integration tests run against real infrastructure because the interesting bu
 |---|---|
 | `TestConcurrentClaimsNeverOverlap` | 10 competing workers claim 500 rows; each claimed exactly once |
 | `TestCompleteAttemptRejectsStaleLease` | a worker that lost its lease cannot overwrite the new owner |
+| `TestLateSuccessWinsUntilTheRowIsClaimedAgain` | a delivered message is not sent again because its result came late |
 | `TestRateLimitHoldsAcrossTwoWorkers` | two engines together never exceed the limit in any sliding second |
+| `TestRateLimitHoldsWhenClaimsStall` | the limit holds when claims stall for 0.4-0.6s |
+| `TestFutureHighPriorityBacklogDoesNotBlockDueRows` | a scheduled campaign does not hide due work |
 | `TestHighPriorityOvertakesBacklog` | a high-priority message queued last is delivered first |
 | `TestCircuitBreakerPreservesAttemptsDuringOutage` | an outage does not burn every message's retries |
 | `TestTransientFailuresAreRetriedUntilDelivered` / `TestGivesUpAfterMaxAttempts` / `TestPermanentFailureIsNotRetried` | the retry policy end to end |
@@ -274,7 +297,7 @@ The integration tests run against real infrastructure because the interesting bu
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, the full suite with
 `-race`, and an e2e job that boots the compose stack and waits for a notification to reach
-`sent`. Cross-package statement coverage of `internal/` is about 77%.
+`sent`. Cross-package statement coverage of `internal/` is 80%.
 
 ## Using webhook.site as the provider
 
@@ -292,6 +315,8 @@ requests, which a rate-limit or retry test exhausts quickly, and it cannot injec
 ## Configuration
 
 All settings are environment variables with working defaults ([`internal/config`](internal/config/config.go), [`.env.example`](.env.example)).
+With docker compose, put them in a `.env` file next to `docker-compose.yml`; every service
+loads it.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -305,11 +330,16 @@ All settings are environment variables with working defaults ([`internal/config`
 | `CLAIM_BATCH_SIZE` | `25` | Rows claimed per dispatcher loop |
 | `LEASE_DURATION` / `REAP_INTERVAL` | `30s` / `10s` | Crash recovery (lease must exceed `PROVIDER_TIMEOUT`) |
 | `PROVIDER_TIMEOUT` | `5s` | Per-request timeout |
+| `DATABASE_MAX_CONNS` | `20` | Postgres pool size per process |
+| `API_KEYS` | empty | Comma-separated keys required on `/v1` (Bearer or `X-API-Key`); empty = no auth, for local use |
+| `WS_ALLOWED_ORIGINS` | `localhost:*,127.0.0.1:*` | Browser origins allowed to open the WebSocket |
 | `MOCK_FAILURE_RATE` / `MOCK_THROTTLE_RATE` / `MOCK_REJECT_RATE` | `0.05` / `0.02` / `0` | Mock provider fault injection (also changeable live: `POST :9090/config`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Jaeger in compose | Tracing; empty disables it |
 
-Content limits (characters, not bytes): SMS 1600 (10 concatenated segments), email 100,000,
-push 1,000. Recipients: E.164 phone, plain email address, or an 8-512 character device token.
+Content limits (characters, not bytes): SMS 1600 (10 concatenated segments of plain GSM
+text; Turkish characters or emoji switch SMS to 70-character segments, so a real provider
+would bill more segments), email 100,000, push 1,000. Templates use `{{.name}}` placeholders
+only: no functions or loops, because template bodies come from API callers. Recipients: E.164 phone, plain email address, or an 8-512 character device token.
 
 ## Trade-offs and what I would do next
 
@@ -318,8 +348,9 @@ push 1,000. Recipients: E.164 phone, plain email address, or an 8-512 character 
   a few thousand messages per second I would keep Postgres as the state store and move dispatch
   to Kafka (topic per channel and priority, partitioned by recipient) fed by a transactional
   outbox. The `delivery.Queue` interface is the seam for that.
-- **Multi-tenancy:** scope idempotency keys, rate limits and templates per tenant, and add
-  authentication. They are global here because the assessment has no notion of tenants.
+- **Multi-tenancy:** scope idempotency keys, rate limits and templates per tenant, with
+  per-tenant API keys. They are global here because the assessment has no notion of tenants.
+  Idempotency keys are also kept forever; with retention they would expire after e.g. 30 days.
 - **Data lifecycle:** partition `notifications` and `notification_attempts` by month and
   archive old partitions; the dispatch index is partial, so it stays small regardless.
 - **Provider resilience:** the breaker is per worker process (simple, no shared state; each
@@ -332,10 +363,17 @@ push 1,000. Recipients: E.164 phone, plain email address, or an 8-512 character 
 ## How this was built
 
 I built this with Claude Code as a pair programmer, the same way I work day to day: I own the
-design decisions and the verification, and the agent does a large part of the typing. The
-commit history is the engineering log (each commit says what changed and why), and
-[`docs/AI_WORKFLOW.md`](docs/AI_WORKFLOW.md) describes the workflow. It also lists the five
-real defects that the verification steps caught before the code was done: host-vs-database
-clock skew, token-bucket overshoot, permit-to-send skew, a Redis key collision on rolling
-deploy, and a silent tracing misconfiguration. [`CLAUDE.md`](CLAUDE.md) holds the project
-context and invariants given to the agent.
+design decisions and the verification, and the agent does a large part of the typing.
+[`docs/AI_WORKFLOW.md`](docs/AI_WORKFLOW.md) describes the workflow and lists the real defects
+that verification caught: host-vs-database clock skew, token-bucket overshoot, permit-to-send
+skew, a Redis key collision on rolling deploy, and a silent tracing misconfiguration. After
+that, independent reviewer agents on a different model reviewed the finished repository cold
+and found more (a template-rendering memory blow-up, rate-limit overshoot under a database
+stall, and others); [`docs/reviews/`](docs/reviews/) has each review, its findings and the
+commit that fixed each one. [`CLAUDE.md`](CLAUDE.md) holds the project context and
+invariants given to the agent, and [`.claude/agents/reviewer.md`](.claude/agents/reviewer.md)
+the reviewer.
+
+About the history: the commits up to `docs: README, ADRs, AI workflow and agent context` were
+cut into logical steps from a working tree in build order, so their timestamps cluster and do
+not show how long each step took. The commits after it were made as the work happened.

@@ -26,6 +26,11 @@ window:
 
 - `FOR UPDATE SKIP LOCKED` makes sure only one worker owns a notification at a time.
 - The completion update is guarded by the lease, so a slow worker cannot resurrect a row.
+  Exception: a late *success* still wins while nobody has claimed the row again (its
+  `attempts` is unchanged), even if the reaper already put it back in the queue. The message
+  was delivered; discarding that result would only cause a duplicate send.
+- A batch-level `Idempotency-Key` header derives `<key>:<index>` for items without their own
+  key, so a client retrying a timed-out batch does not double-send it.
 - Every provider call carries `Idempotency-Key: <notification id>`, stable across retries, so
   a provider that supports it de-duplicates. The mock provider does, and `/stats` counts the
   suppressed duplicates.
