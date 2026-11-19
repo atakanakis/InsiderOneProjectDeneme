@@ -198,6 +198,65 @@ func TestCompleteAttemptRejectsStaleLease(t *testing.T) {
 	assert.Len(t, attempts, 1, "the stale attempt is still recorded for audit")
 }
 
+// A worker whose lease expired still delivered the message. If the row has
+// not been claimed again, its success must win, or the customer gets the
+// message twice.
+func TestLateSuccessWinsUntilTheRowIsClaimedAgain(t *testing.T) {
+	s := store.New(testutil.Setup(t).Pool)
+	ctx := context.Background()
+	n := newNotification(domain.ChannelSMS, domain.PriorityNormal)
+	_, err := s.CreateNotification(ctx, n)
+	require.NoError(t, err)
+
+	_, err = s.ClaimDue(ctx, domain.ChannelSMS, 1, 10*time.Millisecond)
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	reaped, err := s.ReapExpiredLeases(ctx)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1)
+
+	late := store.AttemptResult{
+		NotificationID: n.ID, AttemptNumber: 1, Channel: domain.ChannelSMS,
+		Outcome: domain.OutcomeRetryable, NewStatus: domain.StatusRetrying,
+	}
+	_, err = s.CompleteAttempt(ctx, late)
+	assert.ErrorIs(t, err, store.ErrStaleLease, "a late failure never overrides the reaper")
+
+	late.Outcome, late.NewStatus = domain.OutcomeDelivered, domain.StatusSent
+	got, err := s.CompleteAttempt(ctx, late)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusSent, got.Status)
+
+	again, err := s.ClaimDue(ctx, domain.ChannelSMS, 1, time.Minute)
+	require.NoError(t, err)
+	assert.Empty(t, again, "a sent notification is not delivered again")
+}
+
+// Claims run per priority so that a deep backlog of future high-priority
+// rows does not hide due rows of lower priority.
+func TestFutureHighPriorityBacklogDoesNotBlockDueRows(t *testing.T) {
+	s := store.New(testutil.Setup(t).Pool)
+	ctx := context.Background()
+	tomorrow := time.Now().Add(24 * time.Hour)
+	var rows []domain.Notification
+	for range 200 {
+		f := newNotification(domain.ChannelSMS, domain.PriorityHigh)
+		f.ScheduledAt = &tomorrow
+		rows = append(rows, f)
+	}
+	low := newNotification(domain.ChannelSMS, domain.PriorityLow)
+	high := newNotification(domain.ChannelSMS, domain.PriorityHigh)
+	rows = append(rows, low, high)
+	_, err := s.CreateBatch(ctx, rows)
+	require.NoError(t, err)
+
+	got, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, high.ID, got[0].ID, "due high priority first")
+	assert.Equal(t, low.ID, got[1].ID)
+}
+
 func TestReapFailsRowsWithoutAttemptsLeft(t *testing.T) {
 	s := store.New(testutil.Setup(t).Pool)
 	ctx := context.Background()

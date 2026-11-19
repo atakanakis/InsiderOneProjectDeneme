@@ -36,8 +36,9 @@ make load                        # burst test against the running stack
 1. **One clock for the queue.** `next_attempt_at`, leases and backoff are computed by Postgres
    (`now()`); the rate limiter uses Redis `TIME`. Never compare queue times with `time.Now()`
    from Go.
-2. **Status changes after a claim only under the lease guard** (`status='processing' AND
-   attempts=$n`). Late results must lose (`ErrStaleLease`).
+2. **Status changes after a claim only under the lease guard** (`attempts=$n`, status
+   `processing`). Late results lose (`ErrStaleLease`), except a late success on a row nobody
+   has claimed again: it was delivered, so it wins.
 3. **Take rate-limit permits before claiming rows**, refund what was not used, and never send
    on a permit older than the window margin (`PermitMaxAge`): re-take it instead.
 4. **Classification lives in `delivery.Classify`.** Only transient failures are retried, and

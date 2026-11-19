@@ -17,14 +17,37 @@ import (
 // FOR UPDATE SKIP LOCKED is what makes this safe with many workers: rows
 // another worker is claiming at the same moment are skipped instead of
 // waited on, so two workers never receive the same notification.
+//
+// It claims one priority at a time. A single query ordered by
+// (priority, next_attempt_at) cannot use next_attempt_at <= now() as an index
+// range, so millions of future high-priority rows (a campaign scheduled for
+// tomorrow) would be walked on every claim before reaching due normal rows.
+// Per priority, the dispatch index (channel, priority, next_attempt_at) gives
+// an exact range scan that stops at now().
 func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+	var out []domain.Notification
+	for _, p := range domain.Priorities {
+		if len(out) >= limit {
+			break
+		}
+		items, err := s.claimPriority(ctx, ch, p, limit-len(out), lease)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, items...)
+	}
+	return out, nil
+}
+
+func (s *Store) claimPriority(ctx context.Context, ch domain.Channel, p domain.Priority, limit int, lease time.Duration) ([]domain.Notification, error) {
 	rows, err := s.pool.Query(ctx, `
 		WITH due AS (
 			SELECT id FROM notifications
 			WHERE channel = $1
+			  AND priority = $4
 			  AND status IN ('pending', 'retrying')
 			  AND next_attempt_at <= now()
-			ORDER BY priority, next_attempt_at, id
+			ORDER BY next_attempt_at, id
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
@@ -36,7 +59,7 @@ func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, leas
 		FROM due
 		WHERE n.id = due.id
 		RETURNING `+prefixed("n", notificationColumns),
-		string(ch), limit, lease.Seconds())
+		string(ch), limit, lease.Seconds(), p.Rank())
 	if err != nil {
 		return nil, fmt.Errorf("claim due: %w", err)
 	}
@@ -46,9 +69,6 @@ func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, leas
 	}
 	// UPDATE ... RETURNING does not preserve the CTE order.
 	slices.SortFunc(items, func(a, b domain.Notification) int {
-		if d := int(a.Priority.Rank()) - int(b.Priority.Rank()); d != 0 {
-			return d
-		}
 		return a.NextAttemptAt.Compare(b.NextAttemptAt)
 	})
 	return items, nil
@@ -73,6 +93,11 @@ type AttemptResult struct {
 // lease for exactly this attempt; if the lease expired and the row was
 // handed to someone else, ErrStaleLease is returned and the newer owner's
 // state wins. The attempt row is written either way: it really happened.
+//
+// One exception: a late success still counts if nobody claimed the row
+// again (attempts is unchanged), even if the reaper already put it back in
+// the queue. The message was delivered; discarding that would only cause a
+// duplicate send to the customer.
 func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.Notification, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -98,7 +123,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 		    sent_at = CASE WHEN $3 = 'sent' THEN now() ELSE sent_at END,
 		    locked_until = NULL,
 		    updated_at = now()
-		WHERE id = $1 AND status = 'processing' AND attempts = $2
+		WHERE id = $1 AND attempts = $2
+		  AND (status = 'processing'
+		       OR ($3 = 'sent' AND status IN ('pending', 'retrying', 'failed')))
 		RETURNING `+notificationColumns,
 		r.NotificationID, r.AttemptNumber, string(r.NewStatus), r.RetryDelay.Seconds(),
 		r.ProviderMessageID, r.Error))
