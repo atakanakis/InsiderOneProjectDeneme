@@ -15,6 +15,12 @@ name: notification-engine
 x-app: &app
   image: notification-engine:local
   restart: unless-stopped
+  # Every setting in an optional .env file reaches the services (see
+  # .env.example and internal/config); the entries below are the defaults
+  # this stack needs.
+  env_file:
+    - path: .env
+      required: false
   environment: &env
     DATABASE_URL: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
     REDIS_URL: redis://redis:6379/0

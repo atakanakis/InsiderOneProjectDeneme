@@ -63,7 +63,7 @@ def main():
     print(f"all {count} finished in {elapsed:.1f}s ({count / elapsed:.1f} msg/s incl. retry backoff)")
     print(f"provider requests: {sms['received']} (accepted {sms['accepted']}, "
           f"failed/throttled {stats['failedResponses']} and retried)")
-    print(f"max requests in any second: {sms['maxRequestsPerSecond']} (limit 100)")
+    print(f"max requests in any sliding second: {sms['maxRequestsInAnySlidingSecond']} (limit 100)")
 
 
 if __name__ == "__main__":

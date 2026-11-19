@@ -2,7 +2,9 @@
 // provider (webhook.site in the assessment). It speaks the same contract and
 // adds what webhook.site cannot: configurable failures and latency for
 // exercising retries and the circuit breaker, idempotency-key de-duplication,
-// and per-second throughput counters for verifying the rate limit.
+// and throughput counters for verifying the rate limit: the maximum number
+// of requests in any sliding one-second window (the strict measure) and
+// per calendar second (for the lastSeconds view).
 //
 //	FAILURE_RATE    fraction of requests answered with 503   (default 0)
 //	THROTTLE_RATE   fraction answered with 429 + Retry-After  (default 0)
@@ -35,10 +37,16 @@ type settings struct {
 // channelStats counts every request that reaches the provider, successful or
 // not, because the rate limit applies to all calls we make.
 type channelStats struct {
-	Received     int           `json:"received"`
-	Accepted     int           `json:"accepted"`
-	MaxPerSecond int           `json:"maxRequestsPerSecond"`
+	Received int `json:"received"`
+	Accepted int `json:"accepted"`
+	// MaxSliding is the most requests seen in any one-second window, wherever
+	// it starts. This is what "at most N per second" has to hold for.
+	MaxSliding int `json:"maxRequestsInAnySlidingSecond"`
+	// MaxPerSecond counts per calendar second only. It is always <= MaxSliding
+	// and can hide a burst that straddles a second boundary.
+	MaxPerSecond int           `json:"maxRequestsPerCalendarSecond"`
 	perSecond    map[int64]int // unix second -> requests received
+	recent       []time.Time   // arrivals within the last second
 }
 
 type provider struct {
@@ -102,7 +110,15 @@ func (p *provider) send(w http.ResponseWriter, r *http.Request) {
 		p.channels[req.Channel] = cs
 	}
 	cs.Received++
-	sec := time.Now().Unix()
+	now := time.Now()
+	cs.recent = append(cs.recent, now)
+	drop := 0
+	for drop < len(cs.recent) && now.Sub(cs.recent[drop]) >= time.Second {
+		drop++
+	}
+	cs.recent = cs.recent[drop:]
+	cs.MaxSliding = max(cs.MaxSliding, len(cs.recent))
+	sec := now.Unix()
 	cs.perSecond[sec]++
 	cs.MaxPerSecond = max(cs.MaxPerSecond, cs.perSecond[sec])
 	delete(cs.perSecond, sec-120)
