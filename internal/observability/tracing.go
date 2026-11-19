@@ -3,7 +3,6 @@ package observability
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -22,11 +21,9 @@ func SetupTracing(ctx context.Context, service, endpoint string) (func(context.C
 	if endpoint == "" {
 		return func(context.Context) error { return nil }, nil
 	}
-	opts := []otlptracehttp.Option{otlptracehttp.WithEndpointURL(endpoint)}
-	if strings.HasPrefix(endpoint, "http://") {
-		opts = append(opts, otlptracehttp.WithInsecure())
-	}
-	exp, err := otlptracehttp.New(ctx, opts...)
+	// The exporter reads the standard OTEL_EXPORTER_OTLP_* variables itself,
+	// which appends /v1/traces to the base endpoint and handles http vs https.
+	exp, err := otlptracehttp.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("otlp exporter: %w", err)
 	}
