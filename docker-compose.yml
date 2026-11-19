@@ -82,6 +82,9 @@ services:
   worker:
     <<: *app
     command: ["/app/worker"]
+    # Room to finish in-flight deliveries (provider timeout 5s) and record
+    # their results before Docker kills the process.
+    stop_grace_period: 30s
     deploy:
       replicas: 2
     environment:

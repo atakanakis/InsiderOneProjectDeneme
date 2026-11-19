@@ -56,8 +56,8 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, n)
 }
 
-// Room for ":<index>" within domain.MaxIdempotencyKeyLength.
-const maxBatchKeyLength = domain.MaxIdempotencyKeyLength - 5
+// Room for "batch:" and ":<index>" within domain.MaxIdempotencyKeyLength.
+const maxBatchKeyLength = domain.MaxIdempotencyKeyLength - len("batch:") - len(":999")
 
 type batchRequest struct {
 	Notifications []service.CreateInput `json:"notifications"`
@@ -82,8 +82,9 @@ type batchResponse struct {
 // POST /v1/notifications/batch (up to 1000 items, all-or-nothing).
 //
 // An Idempotency-Key header covers the whole batch: items without their own
-// key get "<header>:<index>", so re-sending the same batch after a timeout
-// replays it instead of sending every message twice.
+// key get "batch:<header>:<index>", so re-sending the same batch after a
+// timeout replays it instead of sending every message twice. The prefix
+// keeps derived keys apart from keys clients choose for single requests.
 func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 	var req batchRequest
 	if !decodeJSON(w, r, maxBatchBody, &req) {
@@ -97,7 +98,7 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		for i := range req.Notifications {
 			if req.Notifications[i].IdempotencyKey == nil {
-				k := fmt.Sprintf("%s:%d", key, i)
+				k := fmt.Sprintf("batch:%s:%d", key, i)
 				req.Notifications[i].IdempotencyKey = &k
 			}
 		}
@@ -313,8 +314,10 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	window := 5 * time.Minute
 	if v := r.URL.Query().Get("window"); v != "" {
 		d, err := time.ParseDuration(v)
-		if err != nil || d < time.Second || d > 24*time.Hour {
-			writeError(w, http.StatusBadRequest, "invalid_window", "window must be a duration between 1s and 24h, e.g. 5m")
+		// Percentiles are computed over every attempt in the window, so the
+		// window is bounded; longer views belong in Prometheus.
+		if err != nil || d < time.Second || d > time.Hour {
+			writeError(w, http.StatusBadRequest, "invalid_window", "window must be a duration between 1s and 1h, e.g. 5m")
 			return
 		}
 		window = d

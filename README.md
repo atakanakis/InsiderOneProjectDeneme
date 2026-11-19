@@ -240,7 +240,8 @@ of the backlog had been processed. Total time (~33s) is dominated by the retry b
 
 - Clients send `Idempotency-Key` (header) or `idempotencyKey` (body, per batch item). On the
   batch endpoint the header covers the whole batch: items without their own key get
-  `<header>:<index>`, so re-sending a batch after a timeout replays it.
+  `batch:<header>:<index>`, so re-sending a batch after a timeout replays it. It works item by
+  item: a changed item is a `409`, an added item is created.
 - A `UNIQUE` index plus `INSERT ... ON CONFLICT DO NOTHING` makes this race-free: 20
   simultaneous requests with one key create one row (`TestConcurrentIdempotentCreatesYieldOneRow`).
 - A replay returns the original notification with `200` and `Idempotent-Replayed: true`.
@@ -259,7 +260,9 @@ of the backlog had been processed. Total time (~33s) is dominated by the retry b
 - **`GET /metrics`** (API) and `:9091/metrics` (each worker): Prometheus counters and histograms
   such as `notification_queue_depth`, `notification_delivery_attempts_total{outcome}`,
   `notification_provider_request_duration_seconds`, `notification_end_to_end_latency_seconds`,
-  `notification_circuit_breaker_state` and `http_request_duration_seconds{route}`.
+  `notification_circuit_breaker_state` and `http_request_duration_seconds{route}`. Every
+  worker exports the same database-wide queue-depth gauge, so aggregate it with `max()`, not
+  `sum()`.
 - **Structured JSON logs** (`log/slog`). Every line carries `correlation_id` and `trace_id`.
   The correlation ID from `X-Correlation-ID` (or a generated one) is stored with each
   notification, so worker log lines for an async delivery minutes later can be matched to the
@@ -376,4 +379,5 @@ the reviewer.
 
 About the history: the commits up to `docs: README, ADRs, AI workflow and agent context` were
 cut into logical steps from a working tree in build order, so their timestamps cluster and do
-not show how long each step took. The commits after it were made as the work happened.
+not show how long each step took. The commits after it were made one fix at a time, in the
+order the work was done; some are seconds apart because one change was committed as two.

@@ -199,6 +199,10 @@ func TestAPIKeyIsRequiredWhenConfigured(t *testing.T) {
 	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
 	resp, _ = c.do("GET", "/v1/notifications", nil, "X-API-Key", "secret-1")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	resp, _ = c.do("GET", "/v1/notifications", nil, "Authorization", "bearer secret-1")
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "the auth scheme is case-insensitive")
+	resp, _ = c.do("GET", "/v1/notifications?apiKey=secret-1", nil)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, "?apiKey= is only for the WebSocket")
 
 	for _, open := range []string{"/healthz", "/readyz", "/metrics", "/openapi.yaml"} {
 		resp, _ = c.do("GET", open, nil)
@@ -478,7 +482,7 @@ func TestBatchIdempotencyKeyHeader(t *testing.T) {
 	assert.EqualValues(t, 2, again["replayed"])
 	assert.Equal(t, first["batchId"], again["batchId"])
 
-	resp, _ = c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", strings.Repeat("k", 124))
+	resp, _ = c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", strings.Repeat("k", 119))
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 

@@ -78,15 +78,16 @@ func (s *Server) Handler() http.Handler {
 		http.Redirect(w, r, "/docs", http.StatusFound)
 	})
 
-	// Outermost first: correlation ID -> panic recovery -> tracing -> access
-	// log -> API key check -> routes (JSON 404/405 for anything unmatched).
+	// Outermost first: correlation ID -> ?apiKey= to header -> panic recovery
+	// -> tracing -> access log -> API key check -> routes (JSON 404/405 for
+	// anything unmatched).
 	h := accessLog(s.log, requireAPIKey(s.opts.APIKeys, jsonFallback(mux)))
 	h = otelhttp.NewHandler(h, "notification-api",
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/metrics" && r.URL.Path != "/healthz" && r.URL.Path != "/readyz"
 		}))
 	h = recoverer(s.log, h)
-	return correlationID(h)
+	return correlationID(apiKeyFromQuery(h))
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {

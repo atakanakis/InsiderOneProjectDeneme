@@ -125,9 +125,11 @@ paths:
           in: header
           description: |
             Covers the whole batch: each item without its own `idempotencyKey`
-            gets `<key>:<index>`, so re-sending the same batch with the same
-            header replays it instead of sending every message again.
-          schema: { type: string, maxLength: 123 }
+            gets `batch:<key>:<index>`, so re-sending the same batch with the
+            same header replays it instead of sending every message again.
+            It works item by item: a changed item returns `409`, an added item
+            is created.
+          schema: { type: string, maxLength: 118 }
       requestBody:
         required: true
         content:
@@ -302,7 +304,7 @@ paths:
       description: Queue depth, in-flight count, success/failure rates and latency percentiles over a sliding window.
       operationId: getMetrics
       parameters:
-        - { name: window, in: query, schema: { type: string, default: 5m, example: 1m } }
+        - { name: window, in: query, description: "Go duration between 1s and 1h.", schema: { type: string, default: 5m, example: 1m } }
       responses:
         '200':
           description: Snapshot.

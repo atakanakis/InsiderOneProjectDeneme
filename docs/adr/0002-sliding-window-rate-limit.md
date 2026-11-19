@@ -52,6 +52,15 @@ per claim.
 - Redis becomes a dependency for sending. If it is down, dispatch pauses (logged, retried
   every second) instead of sending without a limit. Failing closed protects the provider
   contract.
+- If Redis *loses its state* while up (a failover to a replica that had not received the last
+  writes, or a flush), the permits of the last second are forgotten and up to twice the limit
+  can be sent in the window that straddles the loss. A reviewer measured 200 at a limit of
+  100 by flushing Redis four times mid-burst. A plain restart keeps the limit, because the
+  window is rebuilt within a second. Guarding against state loss would need either a local
+  per-process ceiling (which only works with a known, fixed number of workers) or a warm-up
+  period after a key goes missing, which also slows every normal start from idle. Neither seems
+  worth it for an event that needs operator action anyway. The provider's own 429 with
+  `Retry-After`, which the retry policy honours, is the backstop.
 - The key is versioned (`ratelimit:v2:<channel>`) so a rolling deploy from the token-bucket
   build cannot feed the new script a hash (`WRONGTYPE`), which really happened during
   development.

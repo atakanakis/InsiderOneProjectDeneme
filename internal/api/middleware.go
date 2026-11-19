@@ -93,11 +93,8 @@ func requireAPIKey(keys []string, next http.Handler) http.Handler {
 			return
 		}
 		got := r.Header.Get("X-API-Key")
-		if after, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
-			got = after
-		}
-		if got == "" && r.URL.Path == "/v1/ws" {
-			got = r.URL.Query().Get("apiKey") // browsers cannot set WebSocket headers
+		if scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+			got = token
 		}
 		for _, k := range keys {
 			if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
@@ -107,6 +104,27 @@ func requireAPIKey(keys []string, next http.Handler) http.Handler {
 		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="notification-api"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API key is required")
+	})
+}
+
+// apiKeyFromQuery moves a WebSocket client's ?apiKey= into the X-API-Key
+// header (browsers cannot set headers on a WebSocket) and removes it from
+// the URL. It runs before tracing and logging so the key never ends up in a
+// span attribute or a log line.
+func apiKeyFromQuery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/ws" && r.URL.Query().Has("apiKey") {
+			q := r.URL.Query()
+			key := q.Get("apiKey")
+			q.Del("apiKey")
+			r = r.Clone(r.Context())
+			r.URL.RawQuery = q.Encode()
+			r.RequestURI = r.URL.RequestURI()
+			if r.Header.Get("X-API-Key") == "" {
+				r.Header.Set("X-API-Key", key)
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
