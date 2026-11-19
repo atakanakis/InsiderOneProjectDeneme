@@ -42,6 +42,12 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// After the first signal starts a graceful shutdown, stop intercepting:
+	// a second SIGTERM or Ctrl-C then ends the process immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	shutdownTracing, err := observability.SetupTracing(ctx, cfg.ServiceName, cfg.OTLPEndpoint)
 	if err != nil {

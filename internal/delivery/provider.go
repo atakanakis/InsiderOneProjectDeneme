@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -51,10 +53,15 @@ type HTTPProvider struct {
 // dozens of concurrent sends most requests would open a new TCP and TLS
 // connection, adding latency between taking a rate-limit permit and the
 // request arriving.
-func NewHTTPProvider(url string, timeout time.Duration, maxConns int) *HTTPProvider {
+//
+// tune can adjust the transport (tests use it to slow down dialing).
+func NewHTTPProvider(url string, timeout time.Duration, maxConns int, tune ...func(*http.Transport)) *HTTPProvider {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxIdleConns = max(maxConns, 2)
 	tr.MaxIdleConnsPerHost = max(maxConns, 2)
+	for _, fn := range tune {
+		fn(tr)
+	}
 	return &HTTPProvider{
 		url: url,
 		client: &http.Client{
@@ -62,6 +69,17 @@ func NewHTTPProvider(url string, timeout time.Duration, maxConns int) *HTTPProvi
 			Transport: otelhttp.NewTransport(tr),
 		},
 	}
+}
+
+type sendGateKey struct{}
+
+// WithSendGate registers a function that an HTTP provider calls once a
+// connection is ready, immediately before it writes the request. Dialing
+// and the TLS handshake happen before the gate, so whatever the gate checks
+// (the age of a rate-limit permit) is checked at the moment the request
+// really leaves, not when the send was started.
+func WithSendGate(ctx context.Context, gate func()) context.Context {
+	return context.WithValue(ctx, sendGateKey{}, gate)
 }
 
 type providerRequest struct {
@@ -87,6 +105,12 @@ func (p *HTTPProvider) send(ctx context.Context, m Message) Result {
 	body, err := json.Marshal(providerRequest{To: m.To, Channel: m.Channel, Content: m.Content})
 	if err != nil {
 		return Result{Err: err}
+	}
+	if gate, ok := ctx.Value(sendGateKey{}).(func()); ok {
+		var once sync.Once // GotConn can fire again on a transport-level retry
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) { once.Do(gate) },
+		})
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))
 	if err != nil {

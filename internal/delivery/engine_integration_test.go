@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"sync"
 	"testing"
@@ -366,4 +368,139 @@ func TestFailedResultWriteIsRetriedNotResent(t *testing.T) {
 	waitForStatus(t, s, items[0].ID, domain.StatusSent)
 	time.Sleep(opts.Lease + 2*opts.ReapInterval) // give a wrong resend the time to happen
 	assert.Len(t, p.snapshot(), 1, "delivered exactly once")
+}
+
+// Regression (review 3): the permit-age check ended when the delivery
+// goroutine started, so connection setup was not covered. On the first
+// burst after idle every request waits for a new connection while the next
+// second's requests reuse warm ones, and the provider saw 200 at a limit of
+// 100. The permit is now checked again when the connection is ready.
+func TestRateLimitHoldsOnColdConnections(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	const rate, total = 50, 200
+	enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, total)
+
+	var mu sync.Mutex
+	var arrivals []fakeCall
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, fakeCall{at: time.Now()})
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"messageId":"m","status":"accepted"}`))
+	}))
+	defer srv.Close()
+	snapshot := func() []fakeCall {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]fakeCall(nil), arrivals...)
+	}
+
+	slowDial := func(tr *http.Transport) { // every new connection takes 150 ms, like a TLS handshake
+		d := &net.Dialer{}
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			time.Sleep(150 * time.Millisecond)
+			return d.DialContext(ctx, network, addr)
+		}
+	}
+	opts := testOptions()
+	opts.Concurrency, opts.ClaimBatchSize = 50, 25
+	for range 2 {
+		startEngine(t, env, delivery.NewHTTPProvider(srv.URL, 5*time.Second, 50, slowDial), opts, rate)
+	}
+
+	require.Eventually(t, func() bool { return len(snapshot()) >= total }, 30*time.Second, 20*time.Millisecond)
+	calls := snapshot()
+	assert.Len(t, calls, total)
+	maxInWindow := maxInAnySecond(calls)
+	t.Logf("max %d in any 1s window with 150 ms connection setup (limit %d)", maxInWindow, rate)
+	assert.LessOrEqual(t, maxInWindow, rate, "hard limit holds when connections are cold")
+}
+
+// dyingLimiter grants the first Take per channel and then fails, like Redis
+// going away right after the dispatcher took its permits.
+type dyingLimiter struct {
+	mu    sync.Mutex
+	takes map[string]int
+}
+
+func (l *dyingLimiter) Take(_ context.Context, key string, n int) (ratelimit.Grant, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.takes == nil {
+		l.takes = map[string]int{}
+	}
+	l.takes[key]++
+	if l.takes[key] > 1 {
+		return ratelimit.Grant{}, errors.New("injected: redis down")
+	}
+	return ratelimit.Grant{N: n}, nil
+}
+
+func (l *dyingLimiter) Refund(context.Context, string, ratelimit.Grant, int) error { return nil }
+
+func runEngineWith(q delivery.Queue, l delivery.RateLimiter, p delivery.Provider, opts delivery.Options) (stop func() time.Duration) {
+	e := delivery.NewEngine(q, l, p, events.Nop{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		e.Run(ctx)
+		close(done)
+	}()
+	return func() time.Duration {
+		start := time.Now()
+		cancel()
+		<-done
+		return time.Since(start)
+	}
+}
+
+// Rows claimed with permits that went stale, when no fresh permits can be
+// had, go back to the queue with their attempt refunded and are not sent.
+func TestRowsWithoutFreshPermitsAreReleasedNotSpent(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	items := enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, 3)
+	p := newFakeProvider(accepted)
+	opts := testOptions()
+	opts.Lease = 2 * time.Second // rows are released after lease/2
+	stop := runEngineWith(&stallingQueue{Store: s, every: 1, stall: 200 * time.Millisecond}, &dyingLimiter{}, p, opts)
+	defer stop()
+
+	require.Eventually(t, func() bool {
+		n, err := s.GetNotification(context.Background(), items[0].ID)
+		return err == nil && n.Status == domain.StatusPending && n.Attempts == 0 && n.UpdatedAt.After(n.CreatedAt)
+	}, 5*time.Second, 50*time.Millisecond, "the claim is handed back with its attempt refunded")
+	assert.Empty(t, p.snapshot(), "nothing was sent without a permit")
+}
+
+// A shutdown while the dispatcher waits for fresh permits must not hang
+// until the permits arrive; the claimed rows are released.
+func TestShutdownWhileWaitingForPermitsIsPrompt(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	items := enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, 3)
+	p := newFakeProvider(accepted)
+	opts := testOptions()
+	opts.Lease = 30 * time.Second // lease/2 is far away: only shutdown can end the wait
+	stop := runEngineWith(&stallingQueue{Store: s, every: 1, stall: 200 * time.Millisecond}, &dyingLimiter{}, p, opts)
+	waitForStatus(t, s, items[0].ID, domain.StatusProcessing) // claimed, now waiting for permits
+	time.Sleep(300 * time.Millisecond)
+
+	assert.Less(t, stop(), 2*time.Second)
+	n, err := s.GetNotification(context.Background(), items[0].ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusPending, n.Status)
+	assert.Equal(t, 0, n.Attempts)
+	assert.Empty(t, p.snapshot())
 }

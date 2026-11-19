@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -187,11 +188,11 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			e.refund(ctx, key, grant, unused)
 		}
 
-		spawn := func(n domain.Notification) {
+		spawn := func(n domain.Notification, permitAt time.Time) {
 			slots <- struct{}{}
 			inflight.Go(func() {
 				defer func() { <-slots }()
-				e.deliver(deliverCtx, breaker, n, leaseEnd)
+				e.deliver(deliverCtx, breaker, n, leaseEnd, permitAt)
 			})
 		}
 		if age := time.Since(takenAt); len(items) > 0 && age > e.opts.PermitMaxAge {
@@ -206,7 +207,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			e.sendWithFreshPermits(ctx, deliverCtx, breaker, key, items, spawn)
 		} else {
 			for _, n := range items {
-				spawn(n)
+				spawn(n, takenAt)
 			}
 		}
 		if len(items) < granted {
@@ -220,7 +221,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 // before half the lease is gone (Redis down), the rest are released back to
 // the queue without spending an attempt.
 func (e *Engine) sendWithFreshPermits(ctx, deliverCtx context.Context, breaker *Breaker, key string,
-	items []domain.Notification, spawn func(domain.Notification)) {
+	items []domain.Notification, spawn func(domain.Notification, time.Time)) {
 	deadline := time.Now().Add(e.opts.Lease / 2)
 	for len(items) > 0 {
 		takenAt := time.Now()
@@ -229,7 +230,7 @@ func (e *Engine) sendWithFreshPermits(ctx, deliverCtx context.Context, breaker *
 		switch {
 		case err == nil && g.N > 0 && fresh:
 			for _, n := range items[:g.N] {
-				spawn(n)
+				spawn(n, takenAt)
 			}
 			items = items[g.N:]
 			continue
@@ -268,9 +269,35 @@ func (e *Engine) refund(ctx context.Context, key string, g ratelimit.Grant, unus
 	}
 }
 
+// freshPermit takes one new permit for a request whose own permit went
+// stale while its connection was being set up. It gives up after a few
+// seconds (Redis down), and the caller then does not send.
+func (e *Engine) freshPermit(ctx context.Context, key string) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		takenAt := time.Now()
+		g, err := e.limiter.Take(ctx, key, 1)
+		if err == nil && g.N == 1 {
+			if time.Since(takenAt) <= e.opts.PermitMaxAge {
+				return true
+			}
+			e.refund(ctx, key, g, 1)
+		}
+		wait := 200 * time.Millisecond
+		if err == nil {
+			wait = max(g.Wait, 10*time.Millisecond)
+		}
+		if time.Now().Add(wait).After(deadline) {
+			return false
+		}
+		sleep(ctx, wait)
+	}
+}
+
 // deliver performs one attempt and records what happens next. leaseEnd is
-// when this worker's claim on the row expires.
-func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notification, leaseEnd time.Time) {
+// when this worker's claim on the row expires; permitAt is when the
+// rate-limit permit for this send was taken.
+func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notification, leaseEnd, permitAt time.Time) {
 	ctx = observability.ExtractTraceParent(ctx, n.TraceParent)
 	ctx = observability.WithCorrelationID(ctx, n.CorrelationID)
 	ctx, span := e.tracer.Start(ctx, "notification.deliver", trace.WithAttributes(
@@ -281,13 +308,39 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 	))
 	defer span.End()
 
-	res := e.provider.Send(ctx, Message{
+	// The permit is checked once more when the connection is ready, right
+	// before the request is written. Connection setup (TCP, TLS) can take
+	// far longer than the limiter's margin; on the first burst after idle
+	// every request waits for it, while the next second's requests reuse
+	// warm connections, and the two bursts would land in the same second.
+	sendCtx, cancelSend := context.WithCancel(ctx)
+	defer cancelSend()
+	var noPermit atomic.Bool
+	sendCtx = WithSendGate(sendCtx, func() {
+		if time.Since(permitAt) <= e.opts.PermitMaxAge {
+			return
+		}
+		observability.StalePermits.WithLabelValues(string(n.Channel)).Inc()
+		if !e.freshPermit(ctx, string(n.Channel)) {
+			noPermit.Store(true)
+			cancelSend() // do not write the request
+		}
+	})
+
+	res := e.provider.Send(sendCtx, Message{
 		NotificationID: n.ID.String(),
 		CorrelationID:  n.CorrelationID,
 		To:             n.Recipient,
 		Channel:        string(n.Channel),
 		Content:        n.Content,
 	})
+	if noPermit.Load() {
+		// Nothing was sent: hand the row back without spending an attempt.
+		e.log.WarnContext(ctx, "no fresh rate-limit permit when the connection was ready; releasing",
+			"notification_id", n.ID)
+		e.release(ctx, breaker, []domain.Notification{n})
+		return
+	}
 	outcome := Classify(res)
 	breaker.Record(outcome != domain.OutcomeRetryable)
 
