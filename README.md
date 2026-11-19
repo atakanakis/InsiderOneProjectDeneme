@@ -274,6 +274,10 @@ of the backlog had been processed. Total time (~33s) is dominated by the retry b
   `notification_circuit_breaker_state` and `http_request_duration_seconds{route}`. Every
   worker exports the same database-wide queue-depth gauge, so aggregate it with `max()`, not
   `sum()`.
+- **Alert rules** ([`deploy/alerts.yml`](deploy/alerts.yml), loaded by the compose Prometheus at
+  `localhost:9095/alerts`): dead letters growing, breaker open, a due backlog not draining, a
+  high failure rate (which a consecutive-failure breaker can miss), frequent stale permits,
+  slow provider, and a worker not being scraped.
 - **Structured JSON logs** (`log/slog`). Every line carries `correlation_id` and `trace_id`.
   The correlation ID from `X-Correlation-ID` (or a generated one) is stored with each
   notification, so worker log lines for an async delivery minutes later can be matched to the
@@ -294,7 +298,13 @@ make load        # burst test against the running stack
 ```
 
 The integration tests run against real infrastructure because the interesting bugs live there
-(locking, clocks, Lua scripts). Highlights:
+(locking, clocks, Lua scripts). Most of them reproduce one known failure. One does not:
+`TestInvariantsHoldUnderRandomFaults` mixes faults at random (claim stalls, failing result
+writes, slow and failing provider calls, slow new connections, through the fake provider and
+the real HTTP client) and after each scenario checks the invariants that must always hold:
+never over the limit in any sliding second, nothing lost, nothing accepted twice. CI runs
+three fixed scenarios; a soak runs hundreds (see [Randomised fault testing](#randomised-fault-testing)).
+Highlights:
 
 | Test | Proves |
 |---|---|
@@ -318,6 +328,52 @@ The integration tests run against real infrastructure because the interesting bu
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs lint, the full suite with
 `-race`, and an e2e job that boots the compose stack and waits for a notification to reach
 `sent`. Cross-package statement coverage of `internal/` is 80%.
+
+### Randomised fault testing
+
+Every other engine test reproduces one known failure, so a new kind of failure could only be
+found by a reviewer. `TestInvariantsHoldUnderRandomFaults`
+([`chaos_integration_test.go`](internal/delivery/chaos_integration_test.go)) instead draws a
+random mix of faults for each scenario and checks invariants after it:
+
+| Fault, at a random rate per scenario | Range |
+|---|---|
+| A claim returns late (database pause, failover) | 10-40% of claims, 0.2-0.7s |
+| A result write fails (and is retried) | 0-10% of writes |
+| The provider answers 503 / 429 | 0-10% / 0-5% |
+| Provider latency | up to 5-65 ms |
+| New connection setup (real HTTP client, 2 idle connections, so most sends dial) | up to 0-250 ms |
+
+Each scenario sends 300 SMS of mixed priority through two workers at a limit of 50/s, half of
+them through the real HTTP client, and then checks: the provider never saw more than 50 in any
+sliding second, all 300 were delivered, and none was accepted twice. A failing scenario logs
+its seed. CI runs three fixed scenarios; a soak runs many:
+
+```bash
+CHAOS_RUNS=200 CHAOS_SEED=1000 go test -count=1 -run TestInvariantsHoldUnderRandomFaults \
+    -v -timeout 60m ./internal/delivery/ | tee chaos.log
+python3 scripts/chaos_summary.py chaos.log
+```
+
+Soak result at this commit (seeds 1-3 and 1000-1199, 25 minutes):
+
+| | Result |
+|---|---|
+| Scenarios | 203 (105 through the real HTTP client) |
+| All invariants held | **203/203 (100%)** |
+| Rate limit held in every sliding second | 203/203 |
+| Nothing lost (60,900 notifications) | 203/203 |
+| Nothing accepted twice | 203/203 |
+| Peak in any second | exactly the limit (50) in 194 runs, 45-49 in 9 |
+| Provider requests | 65,636 for 60,900 notifications (7.8% retries after injected failures) |
+
+A second check, the **protection map** in [`docs/verification.md`](docs/verification.md),
+disables each of 15 guards in turn and records which test turns red: all 15 are caught.
+
+What this does not cover, on purpose: a worker killed outright (`kill -9`) and result writes
+failing for longer than a lease. Both cause a resend by design (at-least-once). Redis losing
+its state is also not covered ([ADR 0002](docs/adr/0002-sliding-window-rate-limit.md)). A
+passing soak means no failure was found among the faults tried, not that there is none.
 
 ## Using webhook.site as the provider
 
@@ -361,6 +417,19 @@ text; Turkish characters or emoji switch SMS to 70-character segments, so a real
 would bill more segments), email 100,000, push 1,000. Templates use `{{.name}}` placeholders
 only: no functions or loops, because template bodies come from API callers. Recipients: E.164 phone, plain email address, or an 8-512 character device token.
 
+## Deliberately not done
+
+Each of these came up in review and would change how messages flow. Each is a trade-off whose
+right answer depends on the real provider's behaviour, which this assessment does not expose,
+so I documented it instead of guessing. Doing them blind could make the system worse.
+
+| Change | Would help when | Could hurt because |
+|---|---|---|
+| Longer retry budget (now 5 attempts over about 30s) | A provider outage lasts minutes: fewer messages end up dead-lettered | An OTP delivered ten minutes late is useless, and failures surface later. The better shape is a budget per priority, set from real outage data. |
+| Pause the whole channel on a 429 with `Retry-After` | The provider throttles per account | A provider (or the mock) that throttles a few random requests would halve throughput. It needs a threshold tuned on real traffic. webhook.site never sends 429. |
+| A breaker that opens on failure *rate*, not consecutive failures | A provider fails 30-50% of calls for a while | False trips stop a healthy channel, and it adds state to the dispatcher. The `DeliveryFailureRateHigh` alert covers the case for a human meanwhile. |
+| Rewrite or simplify the dispatcher loop | Readability: it grew by one guard per review round | A first attempt showed a guard I thought redundant is still needed (the stall test failed without it). The behaviour is protected by tests, so I left it rather than risk it. |
+
 ## Trade-offs and what I would do next
 
 - **Postgres as the queue** is right for this scale (100/s × 3 channels; "millions per day"
@@ -376,7 +445,6 @@ only: no functions or loops, because template bodies come from API callers. Reci
 - **Provider resilience:** the breaker is per worker process (simple, no shared state; each
   worker detects an outage within 5 calls). A shared breaker in Redis and fail-over to a
   secondary provider per channel would be the next steps.
-- **Alerting:** Prometheus rules on dead-letter growth, breaker open, and queue age.
 - **Per-recipient rules:** quiet hours, user opt-outs and per-user frequency caps belong in a
   pre-send policy step.
 

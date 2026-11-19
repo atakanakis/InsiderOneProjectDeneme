@@ -104,6 +104,19 @@ None of the first five defects would have been caught by unit tests with mocks, 
 if "the code compiles and the agent says it works" were the bar. The two major findings of round 1 would
 have shipped if "my own tests pass" were the bar.
 
+## From reviews to self-verification
+
+The reviews found real bugs, but each found one more, and every test they left behind
+reproduced one known failure. A new kind of failure could only be found by the next reviewer.
+Two additions changed that ([`docs/verification.md`](verification.md)):
+
+- **A protection map.** Each of 15 guards was disabled in turn to see which test turned red.
+  All 15 are caught. Two first mutations did not compile and were redone, so that the
+  compiler would not be counted as a test.
+- **A randomised fault test.** Faults are mixed at random, and three invariants are checked
+  after every scenario. 203 of 203 scenarios held. It also caught a broken guard that the
+  targeted stall test missed in one of seven runs.
+
 ## What stays human
 
 Architecture choices and their trade-offs, the retry semantics, deciding what "maximum 100 per
