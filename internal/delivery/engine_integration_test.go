@@ -2,6 +2,7 @@ package delivery_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -324,4 +325,45 @@ func TestRateLimitHoldsWhenClaimsStall(t *testing.T) {
 	maxInWindow := maxInAnySecond(calls)
 	t.Logf("max %d in any 1s window with stalled claims (limit %d)", maxInWindow, rate)
 	assert.LessOrEqual(t, maxInWindow, rate, "hard limit holds even when claims stall")
+}
+
+// flakyCompletion fails the first few result writes, like a dropped
+// connection or a failover right after the provider accepted the message.
+type flakyCompletion struct {
+	*store.Store
+	mu       sync.Mutex
+	failures int
+}
+
+func (q *flakyCompletion) CompleteAttempt(ctx context.Context, r store.AttemptResult) (domain.Notification, error) {
+	q.mu.Lock()
+	fail := q.failures > 0
+	if fail {
+		q.failures--
+	}
+	q.mu.Unlock()
+	if fail {
+		return domain.Notification{}, errors.New("injected: connection reset")
+	}
+	return q.Store.CompleteAttempt(ctx, r)
+}
+
+// Regression (review 2): one failed result write made the worker give up;
+// the reaper then resent a message the provider had already accepted.
+func TestFailedResultWriteIsRetriedNotResent(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	items := enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, 1)
+
+	p := newFakeProvider(accepted)
+	opts := testOptions()
+	opts.Lease = 3 * time.Second
+	startEngineOn(t, env, &flakyCompletion{Store: s, failures: 2}, p, opts, 100)
+
+	waitForStatus(t, s, items[0].ID, domain.StatusSent)
+	time.Sleep(opts.Lease + 2*opts.ReapInterval) // give a wrong resend the time to happen
+	assert.Len(t, p.snapshot(), 1, "delivered exactly once")
 }

@@ -257,6 +257,64 @@ func TestFutureHighPriorityBacklogDoesNotBlockDueRows(t *testing.T) {
 	assert.Equal(t, low.ID, got[1].ID)
 }
 
+// Regression (review 2): claims run one statement per priority. If a later
+// statement failed, rows from the earlier ones stayed "processing" with an
+// attempt spent and nobody sending them.
+func TestClaimIsAllOrNothing(t *testing.T) {
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	ctx := context.Background()
+	high := newNotification(domain.ChannelSMS, domain.PriorityHigh)
+	normal := newNotification(domain.ChannelSMS, domain.PriorityNormal)
+	_, err := s.CreateBatch(ctx, []domain.Notification{high, normal})
+	require.NoError(t, err)
+
+	_, err = env.Pool.Exec(ctx, `
+		CREATE FUNCTION fail_normal_claims() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.priority = 1 AND NEW.status = 'processing' THEN RAISE EXCEPTION 'injected'; END IF;
+			RETURN NEW;
+		END $$ LANGUAGE plpgsql;
+		CREATE TRIGGER fail_normal_claims BEFORE UPDATE ON notifications
+			FOR EACH ROW EXECUTE FUNCTION fail_normal_claims();`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = env.Pool.Exec(context.Background(),
+			`DROP TRIGGER fail_normal_claims ON notifications; DROP FUNCTION fail_normal_claims();`)
+	})
+
+	got, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, time.Minute)
+	require.Error(t, err)
+	assert.Empty(t, got)
+	n, err := s.GetNotification(ctx, high.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusPending, n.Status, "the high-priority claim was rolled back")
+	assert.Equal(t, 0, n.Attempts)
+}
+
+func TestReleaseClaimsRefundsTheAttempt(t *testing.T) {
+	s := store.New(testutil.Setup(t).Pool)
+	ctx := context.Background()
+	n := newNotification(domain.ChannelSMS, domain.PriorityNormal)
+	_, err := s.CreateNotification(ctx, n)
+	require.NoError(t, err)
+
+	claimed, err := s.ClaimDue(ctx, domain.ChannelSMS, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NoError(t, s.ReleaseClaims(ctx, claimed))
+
+	got, err := s.GetNotification(ctx, n.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusPending, got.Status)
+	assert.Equal(t, 0, got.Attempts, "releasing an unsent claim does not spend an attempt")
+
+	again, err := s.ClaimDue(ctx, domain.ChannelSMS, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	assert.Equal(t, 1, again[0].Attempts)
+}
+
 func TestReapFailsRowsWithoutAttemptsLeft(t *testing.T) {
 	s := store.New(testutil.Setup(t).Pool)
 	ctx := context.Background()

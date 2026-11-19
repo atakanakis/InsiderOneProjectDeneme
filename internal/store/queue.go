@@ -24,23 +24,36 @@ import (
 // tomorrow) would be walked on every claim before reaching due normal rows.
 // Per priority, the dispatch index (channel, priority, next_attempt_at) gives
 // an exact range scan that stops at now().
+//
+// The per-priority statements run in one transaction: either every row is
+// claimed or none is. Otherwise a failure in a later statement would leave
+// earlier rows in "processing" with an attempt spent and nobody sending them.
 func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("claim due: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
+
 	var out []domain.Notification
 	for _, p := range domain.Priorities {
 		if len(out) >= limit {
 			break
 		}
-		items, err := s.claimPriority(ctx, ch, p, limit-len(out), lease)
+		items, err := claimPriority(ctx, tx, ch, p, limit-len(out), lease)
 		if err != nil {
-			return out, err
+			return nil, err
 		}
 		out = append(out, items...)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("claim due: %w", err)
 	}
 	return out, nil
 }
 
-func (s *Store) claimPriority(ctx context.Context, ch domain.Channel, p domain.Priority, limit int, lease time.Duration) ([]domain.Notification, error) {
-	rows, err := s.pool.Query(ctx, `
+func claimPriority(ctx context.Context, q querier, ch domain.Channel, p domain.Priority, limit int, lease time.Duration) ([]domain.Notification, error) {
+	rows, err := q.Query(ctx, `
 		WITH due AS (
 			SELECT id FROM notifications
 			WHERE channel = $1
@@ -108,7 +121,8 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO notification_attempts
 			(notification_id, attempt_number, channel, outcome, http_status, error, duration_ms)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (notification_id, attempt_number) DO NOTHING`,
 		r.NotificationID, r.AttemptNumber, string(r.Channel), string(r.Outcome), r.HTTPStatus,
 		r.Error, r.Duration.Milliseconds()); err != nil {
 		return domain.Notification{}, fmt.Errorf("insert attempt: %w", err)
@@ -140,6 +154,30 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 		return domain.Notification{}, ErrStaleLease
 	}
 	return n, nil
+}
+
+// ReleaseClaims gives claimed rows back without spending an attempt, for a
+// worker that claimed them but will not send them (shutdown, or no
+// rate-limit permits before its deadline). Rows whose lease this worker no
+// longer holds are left alone.
+func (s *Store) ReleaseClaims(ctx context.Context, items []domain.Notification) error {
+	ids := make([]uuid.UUID, len(items))
+	attempts := make([]int32, len(items))
+	for i, n := range items {
+		ids[i], attempts[i] = n.ID, int32(n.Attempts)
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE notifications n
+		SET status = CASE WHEN n.attempts > 1 THEN 'retrying' ELSE 'pending' END,
+		    attempts = n.attempts - 1,
+		    locked_until = NULL,
+		    updated_at = now()
+		FROM unnest($1::uuid[], $2::int[]) AS c(id, attempts)
+		WHERE n.id = c.id AND n.status = 'processing' AND n.attempts = c.attempts`, ids, attempts)
+	if err != nil {
+		return fmt.Errorf("release claims: %w", err)
+	}
+	return nil
 }
 
 // ReapExpiredLeases returns notifications whose worker vanished (crash,

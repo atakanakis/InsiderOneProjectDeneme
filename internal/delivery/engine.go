@@ -24,6 +24,7 @@ import (
 type Queue interface {
 	ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error)
 	CompleteAttempt(ctx context.Context, r store.AttemptResult) (domain.Notification, error)
+	ReleaseClaims(ctx context.Context, items []domain.Notification) error
 	ReapExpiredLeases(ctx context.Context) ([]domain.Notification, error)
 	QueueDepth(ctx context.Context) ([]store.QueueDepth, error)
 }
@@ -163,6 +164,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			return
 		}
 		claimCtx, cancelClaim := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		leaseEnd := time.Now().Add(e.opts.Lease) // the lease starts no earlier than this
 		items, err := e.queue.ClaimDue(claimCtx, ch, granted, e.opts.Lease)
 		cancelClaim()
 		if err != nil {
@@ -183,7 +185,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			slots <- struct{}{}
 			inflight.Go(func() {
 				defer func() { <-slots }()
-				e.deliver(deliverCtx, breaker, n)
+				e.deliver(deliverCtx, breaker, n, leaseEnd)
 			})
 		}
 		if age := time.Since(takenAt); len(items) > 0 && age > e.opts.PermitMaxAge {
@@ -195,7 +197,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			observability.StalePermits.WithLabelValues(key).Inc()
 			e.log.Warn("claim outlived its rate-limit permits, re-taking them",
 				"channel", ch, "claim_ms", age.Milliseconds(), "items", len(items))
-			e.sendWithFreshPermits(deliverCtx, key, items, spawn)
+			e.sendWithFreshPermits(ctx, deliverCtx, breaker, key, items, spawn)
 		} else {
 			for _, n := range items {
 				spawn(n)
@@ -208,14 +210,15 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 }
 
 // sendWithFreshPermits sends already-claimed rows as fresh permits become
-// available. It runs on a context detached from shutdown, because the rows
-// are leased to this worker; if permits cannot be had before half the lease
-// is gone (Redis down), it stops and the reaper returns the rest.
-func (e *Engine) sendWithFreshPermits(ctx context.Context, key string, items []domain.Notification, spawn func(domain.Notification)) {
+// available. If the worker is shutting down, or permits cannot be had
+// before half the lease is gone (Redis down), the rest are released back to
+// the queue without spending an attempt.
+func (e *Engine) sendWithFreshPermits(ctx, deliverCtx context.Context, breaker *Breaker, key string,
+	items []domain.Notification, spawn func(domain.Notification)) {
 	deadline := time.Now().Add(e.opts.Lease / 2)
 	for len(items) > 0 {
 		takenAt := time.Now()
-		g, err := e.limiter.Take(ctx, key, len(items))
+		g, err := e.limiter.Take(deliverCtx, key, len(items))
 		fresh := time.Since(takenAt) <= e.opts.PermitMaxAge
 		switch {
 		case err == nil && g.N > 0 && fresh:
@@ -225,11 +228,12 @@ func (e *Engine) sendWithFreshPermits(ctx context.Context, key string, items []d
 			items = items[g.N:]
 			continue
 		case err == nil && g.N > 0:
-			e.refund(ctx, key, g, g.N) // even this Take was slow
+			e.refund(deliverCtx, key, g, g.N) // even this Take was slow
 		}
-		if time.Now().After(deadline) {
-			e.log.Error("no rate-limit permits for claimed notifications; the reaper will return them",
-				"channel", key, "items", len(items), "error", err)
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			e.log.Warn("releasing claimed notifications without sending",
+				"channel", key, "items", len(items), "shutdown", ctx.Err() != nil, "error", err)
+			e.release(deliverCtx, breaker, items)
 			return
 		}
 		wait := time.Second
@@ -240,14 +244,27 @@ func (e *Engine) sendWithFreshPermits(ctx context.Context, key string, items []d
 	}
 }
 
+// release hands claimed-but-unsent rows back to the queue and returns their
+// breaker reservations (a half-open probe among them would otherwise keep
+// the breaker waiting for a result that never comes).
+func (e *Engine) release(ctx context.Context, breaker *Breaker, items []domain.Notification) {
+	breaker.Release(len(items))
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := e.queue.ReleaseClaims(rctx, items); err != nil {
+		e.log.Error("releasing claims failed; the reaper will return them", "items", len(items), "error", err)
+	}
+}
+
 func (e *Engine) refund(ctx context.Context, key string, g ratelimit.Grant, unused int) {
 	if err := e.limiter.Refund(context.WithoutCancel(ctx), key, g, unused); err != nil {
 		e.log.Warn("rate limit refund failed", "channel", key, "error", err)
 	}
 }
 
-// deliver performs one attempt and records what happens next.
-func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notification) {
+// deliver performs one attempt and records what happens next. leaseEnd is
+// when this worker's claim on the row expires.
+func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notification, leaseEnd time.Time) {
 	ctx = observability.ExtractTraceParent(ctx, n.TraceParent)
 	ctx = observability.WithCorrelationID(ctx, n.CorrelationID)
 	ctx, span := e.tracer.Start(ctx, "notification.deliver", trace.WithAttributes(
@@ -312,18 +329,16 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 	span.SetAttributes(attribute.String("notification.outcome", string(outcome)),
 		attribute.String("notification.status", string(result.NewStatus)))
 
-	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	updated, err := e.queue.CompleteAttempt(dbCtx, result)
+	updated, err := e.complete(ctx, result, leaseEnd)
 	if errors.Is(err, store.ErrStaleLease) {
 		e.log.WarnContext(ctx, "lease expired before result was recorded; newer owner wins",
 			"notification_id", n.ID, "attempt", n.Attempts, "outcome", outcome)
 		return
 	}
 	if err != nil {
-		// The lease will expire and the reaper will put the row back, so the
-		// message is not lost; the provider idempotency key prevents a
-		// visible duplicate if this attempt had in fact been delivered.
+		// The reaper will put the row back after the lease expires. If the
+		// message was delivered, the provider idempotency key is the last
+		// line of defence against a duplicate.
 		e.log.ErrorContext(ctx, "recording attempt failed", "notification_id", n.ID, "error", err)
 		return
 	}
@@ -350,6 +365,31 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 			append(logArgs, "next_attempt_at", updated.NextAttemptAt, "error", deref(updated.LastError))...)
 	}
 	e.publisher.Publish(ctx, domain.EventFor(updated))
+}
+
+// complete records the attempt, retrying transient database errors. Giving
+// up after one failed write would let the reaper resend a message the
+// provider already accepted. Failures are retried while the lease lasts; a
+// success for a little longer, because a late success still wins while no
+// other worker has claimed the row (see store.CompleteAttempt).
+func (e *Engine) complete(ctx context.Context, r store.AttemptResult, leaseEnd time.Time) (domain.Notification, error) {
+	deadline := leaseEnd
+	if r.NewStatus == domain.StatusSent {
+		deadline = leaseEnd.Add(e.opts.Lease)
+	}
+	backoff := 100 * time.Millisecond
+	for {
+		dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		n, err := e.queue.CompleteAttempt(dbCtx, r)
+		cancel()
+		if err == nil || errors.Is(err, store.ErrStaleLease) || time.Now().Add(backoff).After(deadline) {
+			return n, err
+		}
+		e.log.WarnContext(ctx, "recording attempt failed, retrying", "notification_id", r.NotificationID,
+			"error", err, "retry_in_ms", backoff.Milliseconds())
+		sleep(ctx, backoff)
+		backoff = min(2*backoff, 2*time.Second)
+	}
 }
 
 func (e *Engine) reap(ctx context.Context) {
