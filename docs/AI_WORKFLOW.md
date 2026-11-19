@@ -84,11 +84,15 @@ main session ──spawn──▶ reviewer agent (cold: requirements + repo only
 |---|---|---|
 | 0 | Same model, cold context | Confirmed the core design. Found 7 edge cases (batch replay link, `\u0000` as a 500, a shutdown window stranding rows, a cross-batch deadlock, schedule mismatch on replay, unvalidated timings, missing error codes in the spec), all fixed in `fix: edge cases found by an independent review pass`. |
 | 1 | Different model (Fable), cold context, failure injection | Found two major problems the earlier passes missed, plus ten smaller ones. Template rendering let one request allocate 2.9 GB. The rate limit was exceeded after a 0.6s database pause (150 at a limit of 100). Details, evidence and the fixing commit for each: [`docs/reviews/01-independent-review.md`](reviews/01-independent-review.md). |
+| 2 | A new Fable instance, given only the written record of round 1 | Verified each round 1 fix with its own fault injection: the stall fix held under every pattern it tried. It then found that two round 1 fixes had problems of their own. The template fix closed the attack per item but not per batch, and the claim fix had given up atomicity. It also found a duplicate send after one failed result write. All were fixed, each with an injected-failure test: [`docs/reviews/02-independent-review.md`](reviews/02-independent-review.md). |
 
-Round 1 also improved the process itself. The template problem sat in a feature that round 0
+Rounds 1 and 2 also improved the process itself. The template problem sat in a feature that round 0
 had passed, because round 0 checked correctness and not abuse. The rate-limit problem broke a
 claim the README made confidently, because our load test never paused the database. Both
-lessons are now rules in the reviewer definition.
+lessons are now rules in the reviewer definition. Round 2 added a third: two of its three
+major findings were inside round 1's fix commits, so the reviewer now treats fix commits as
+its first suspects, and every fix is tested against an injected failure, not only against the
+reproduction that prompted it.
 
 None of the first five defects would have been caught by unit tests with mocks, and all five would have shipped
 if "the code compiles and the agent says it works" were the bar. The two major findings of round 1 would

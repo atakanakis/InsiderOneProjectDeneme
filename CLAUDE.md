@@ -46,6 +46,10 @@ make load                        # burst test against the running stack
 5. **Migrations are append-only.** Never edit an applied migration; add a new numbered file.
 6. **API changes update `api/openapi.yaml`** and the integration tests in `internal/api`.
 7. **Redis key layouts are versioned** (`ratelimit:v2:`); bump the version when changing them.
+8. **A claim is all or nothing** (one transaction), and claimed rows that will not be sent are
+   handed back with `ReleaseClaims` (attempt refunded), never left for the reaper.
+9. **Fixes get an injected-failure test**, not only a test of the reported case. Independent
+   reviews and their resolutions are recorded in `docs/reviews/`.
 
 ## Conventions
 

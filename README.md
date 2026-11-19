@@ -293,6 +293,9 @@ The integration tests run against real infrastructure because the interesting bu
 | `TestRateLimitHoldsAcrossTwoWorkers` | two engines together never exceed the limit in any sliding second |
 | `TestRateLimitHoldsWhenClaimsStall` | the limit holds when claims stall for 0.4-0.6s |
 | `TestFutureHighPriorityBacklogDoesNotBlockDueRows` | a scheduled campaign does not hide due work |
+| `TestClaimIsAllOrNothing` | a failure inside a claim (injected with a trigger) spends no attempts |
+| `TestFailedResultWriteIsRetriedNotResent` | a failed database write after a successful send does not cause a second send |
+| `TestTemplateBatchCannotAmplifyIntoGigabytes` | a small request cannot render unbounded content through templates |
 | `TestHighPriorityOvertakesBacklog` | a high-priority message queued last is delivered first |
 | `TestCircuitBreakerPreservesAttemptsDuringOutage` | an outage does not burn every message's retries |
 | `TestTransientFailuresAreRetriedUntilDelivered` / `TestGivesUpAfterMaxAttempts` / `TestPermanentFailureIsNotRetried` | the retry policy end to end |

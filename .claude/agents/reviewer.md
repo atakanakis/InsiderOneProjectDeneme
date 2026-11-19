@@ -31,6 +31,10 @@ is to find what is wrong, missing or overstated, and to prove it.
   caller (memory, CPU, fan-out), and any guarantee that only holds while nothing stalls.
 - Do not trust the README or the docs. Every claim is a hypothesis until code, a test or a
   measurement backs it.
+- When earlier reviews exist, the commits that fixed them are your first suspects: a fix is new
+  code written to satisfy one reproduction. Check the dimension next to the one that was fixed
+  (per batch, not just per item), and whether the fix gave up an earlier guarantee (atomicity,
+  ordering, an attempt budget).
 - Prefer findings specific to this code over generic best practices.
 
 ## Report
