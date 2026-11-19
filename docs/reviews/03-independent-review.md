@@ -51,6 +51,10 @@ Left as is, with the reason:
   `notifications_finished_total` series.
 - **Bursty output** and the **half-open breaker edge** from earlier rounds.
 
+*Correction after review 4:* the fix for finding 1 was described (in its commit message) as
+"the request is not written" when no fresh permit can be had. That is not guaranteed; see
+[review 4](04-independent-review.md), which changed that path.
+
 ## What this round taught the loop
 
 The amplification problem was "fixed" twice and reproduced a third time in a minute, each time

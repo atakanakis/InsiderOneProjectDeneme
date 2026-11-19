@@ -10,7 +10,6 @@ import (
 	"net/http/httptrace"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -73,8 +72,11 @@ func NewHTTPProvider(url string, timeout time.Duration, maxConns int, tune ...fu
 
 type sendGateKey struct{}
 
-// WithSendGate registers a function that an HTTP provider calls once a
-// connection is ready, immediately before it writes the request. Dialing
+// WithSendGate registers a function that an HTTP provider calls every time a
+// connection is ready, immediately before it writes the request. "Every
+// time" matters: net/http replays a request that carries an Idempotency-Key
+// on a new connection when a reused one turns out to be dead, and that
+// second write needs the check as much as the first. Dialing
 // and the TLS handshake happen before the gate, so whatever the gate checks
 // (the age of a rate-limit permit) is checked at the moment the request
 // really leaves, not when the send was started.
@@ -107,9 +109,8 @@ func (p *HTTPProvider) send(ctx context.Context, m Message) Result {
 		return Result{Err: err}
 	}
 	if gate, ok := ctx.Value(sendGateKey{}).(func()); ok {
-		var once sync.Once // GotConn can fire again on a transport-level retry
 		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-			GotConn: func(httptrace.GotConnInfo) { once.Do(gate) },
+			GotConn: func(httptrace.GotConnInfo) { gate() },
 		})
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(body))

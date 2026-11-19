@@ -316,15 +316,20 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 	sendCtx, cancelSend := context.WithCancel(ctx)
 	defer cancelSend()
 	var noPermit atomic.Bool
+	var permitNanos atomic.Int64
+	permitNanos.Store(permitAt.UnixNano())
 	sendCtx = WithSendGate(sendCtx, func() {
-		if time.Since(permitAt) <= e.opts.PermitMaxAge {
+		if time.Since(time.Unix(0, permitNanos.Load())) <= e.opts.PermitMaxAge {
 			return
 		}
 		observability.StalePermits.WithLabelValues(string(n.Channel)).Inc()
-		if !e.freshPermit(ctx, string(n.Channel)) {
-			noPermit.Store(true)
-			cancelSend() // do not write the request
+		taken := time.Now()
+		if e.freshPermit(ctx, string(n.Channel)) {
+			permitNanos.Store(taken.UnixNano()) // a transport retry is checked against this one
+			return
 		}
+		noPermit.Store(true)
+		cancelSend() // best effort: net/http may already be writing the request
 	})
 
 	res := e.provider.Send(sendCtx, Message{
@@ -334,15 +339,21 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 		Channel:        string(n.Channel),
 		Content:        n.Content,
 	})
-	if noPermit.Load() {
-		// Nothing was sent: hand the row back without spending an attempt.
-		e.log.WarnContext(ctx, "no fresh rate-limit permit when the connection was ready; releasing",
-			"notification_id", n.ID)
-		e.release(ctx, breaker, []domain.Notification{n})
-		return
-	}
 	outcome := Classify(res)
-	breaker.Record(outcome != domain.OutcomeRetryable)
+	if noPermit.Load() {
+		// No permit could be had (Redis unreachable for seconds) and the
+		// request was cancelled. Cancelling after the connection is ready
+		// does not guarantee the request was not written, so this is treated
+		// like any other ambiguous failure: the attempt counts and the row
+		// is retried, with the Idempotency-Key covering the case where the
+		// provider did receive it. An earlier version refunded the attempt
+		// here as "not sent", which could turn into an unrecorded send.
+		res = Result{Err: errors.New("no rate-limit permit when the connection was ready; request cancelled"), Duration: res.Duration}
+		outcome = Classify(res)
+		breaker.Release(1) // not the provider's fault: do not count it against the breaker
+	} else {
+		breaker.Record(outcome != domain.OutcomeRetryable)
+	}
 
 	ch := string(n.Channel)
 	observability.DeliveryAttempts.WithLabelValues(ch, string(outcome)).Inc()

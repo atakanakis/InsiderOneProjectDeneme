@@ -504,3 +504,45 @@ func TestShutdownWhileWaitingForPermitsIsPrompt(t *testing.T) {
 	assert.Equal(t, 0, n.Attempts)
 	assert.Empty(t, p.snapshot())
 }
+
+// partialQueue fails claims the way a store can: sometimes with an error
+// only, sometimes with rows that were claimed plus an error for the rest.
+type partialQueue struct {
+	*store.Store
+	mu    sync.Mutex
+	calls int
+}
+
+func (q *partialQueue) ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+	q.mu.Lock()
+	q.calls++
+	n := q.calls
+	q.mu.Unlock()
+	if ch == domain.ChannelSMS && n%3 == 1 {
+		return nil, errors.New("injected: claim failed")
+	}
+	items, err := q.Store.ClaimDue(ctx, ch, limit, lease)
+	if err == nil && len(items) > 0 {
+		err = errors.New("injected: one priority failed")
+	}
+	return items, err
+}
+
+// Rows returned together with a claim error are already claimed and must be
+// delivered; a claim that returns only an error must not lose anything.
+func TestRowsFromAPartlyFailedClaimAreDelivered(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	items := enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, 20)
+	p := newFakeProvider(accepted)
+	startEngineOn(t, env, &partialQueue{Store: s}, p, testOptions(), 100)
+
+	for _, it := range items {
+		n := waitForStatus(t, s, it.ID, domain.StatusSent)
+		assert.Equal(t, 1, n.Attempts, "no attempt was lost to a failed claim")
+	}
+	assert.Len(t, p.snapshot(), len(items), "each delivered exactly once")
+}
