@@ -78,7 +78,12 @@ func testOptions() delivery.Options {
 
 func startEngine(t *testing.T, env *testutil.Env, p delivery.Provider, opts delivery.Options, rate int) func() {
 	t.Helper()
-	engine := delivery.NewEngine(store.New(env.Pool), ratelimit.New(env.Redis, rate, 50*time.Millisecond), p,
+	return startEngineOn(t, env, store.New(env.Pool), p, opts, rate)
+}
+
+func startEngineOn(t *testing.T, env *testutil.Env, q delivery.Queue, p delivery.Provider, opts delivery.Options, rate int) func() {
+	t.Helper()
+	engine := delivery.NewEngine(q, ratelimit.New(env.Redis, rate, 50*time.Millisecond), p,
 		events.Nop{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -246,20 +251,77 @@ func TestRateLimitHoldsAcrossTwoWorkers(t *testing.T) {
 	calls := p.snapshot()
 	assert.Len(t, calls, total, "no notification delivered twice")
 
+	maxInWindow := maxInAnySecond(calls)
+	t.Logf("delivered %d in %s, max %d in any 1s window", total, elapsed, maxInWindow)
+	assert.LessOrEqual(t, maxInWindow, rate, "hard limit in every sliding one-second window")
+	assert.Greater(t, elapsed, 2*time.Second, "150 messages at 50/s need at least two full windows")
+}
+
+// maxInAnySecond is the largest number of provider calls inside any sliding
+// one-second window, measured where the provider receives them.
+func maxInAnySecond(calls []fakeCall) int {
 	times := make([]time.Time, len(calls))
 	for i, c := range calls {
 		times[i] = c.at
 	}
 	sort.Slice(times, func(i, j int) bool { return times[i].Before(times[j]) })
 	maxInWindow := 0
-	for i := range times { // sliding one-second window
+	for i := range times {
 		j := i
 		for j < len(times) && times[j].Sub(times[i]) < time.Second {
 			j++
 		}
 		maxInWindow = max(maxInWindow, j-i)
 	}
-	t.Logf("delivered %d in %s, max %d in any 1s window", total, elapsed, maxInWindow)
-	assert.LessOrEqual(t, maxInWindow, rate, "hard limit in every sliding one-second window")
-	assert.Greater(t, elapsed, 2*time.Second, "150 messages at 50/s need at least two full windows")
+	return maxInWindow
+}
+
+// stallingQueue makes every few claims return late, like a Postgres pause,
+// failover or long GC: the rows are claimed but reach the dispatcher long
+// after its rate-limit permits were stamped.
+type stallingQueue struct {
+	*store.Store
+	mu    sync.Mutex
+	calls int
+	every int
+	stall time.Duration
+}
+
+func (q *stallingQueue) ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
+	items, err := q.Store.ClaimDue(ctx, ch, limit, lease)
+	q.mu.Lock()
+	q.calls++
+	stall := len(items) > 0 && q.calls%q.every == 0
+	q.mu.Unlock()
+	if stall {
+		time.Sleep(q.stall)
+	}
+	return items, err
+}
+
+// Regression: permits used to be trusted however long the claim took, so a
+// 0.6s database stall let the provider see 150 requests in one second at a
+// limit of 100. The dispatcher now re-takes permits that are older than the
+// margin before sending.
+func TestRateLimitHoldsWhenClaimsStall(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	env := testutil.Setup(t)
+	s := store.New(env.Pool)
+	const rate, total = 50, 300
+	enqueue(t, s, domain.ChannelSMS, domain.PriorityNormal, total)
+
+	p := newFakeProvider(accepted)
+	opts := testOptions()
+	opts.Concurrency, opts.ClaimBatchSize = 50, 25
+	startEngineOn(t, env, &stallingQueue{Store: s, every: 3, stall: 400 * time.Millisecond}, p, opts, rate)
+	startEngineOn(t, env, &stallingQueue{Store: s, every: 4, stall: 600 * time.Millisecond}, p, opts, rate)
+
+	require.Eventually(t, func() bool { return len(p.snapshot()) >= total }, 30*time.Second, 20*time.Millisecond)
+	calls := p.snapshot()
+	assert.Len(t, calls, total, "no notification delivered twice")
+	maxInWindow := maxInAnySecond(calls)
+	t.Logf("max %d in any 1s window with stalled claims (limit %d)", maxInWindow, rate)
+	assert.LessOrEqual(t, maxInWindow, rate, "hard limit holds even when claims stall")
 }

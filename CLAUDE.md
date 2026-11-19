@@ -38,7 +38,8 @@ make load                        # burst test against the running stack
    from Go.
 2. **Status changes after a claim only under the lease guard** (`status='processing' AND
    attempts=$n`). Late results must lose (`ErrStaleLease`).
-3. **Take rate-limit permits before claiming rows**, and refund what was not used.
+3. **Take rate-limit permits before claiming rows**, refund what was not used, and never send
+   on a permit older than the window margin (`PermitMaxAge`): re-take it instead.
 4. **Classification lives in `delivery.Classify`.** Only transient failures are retried, and
    only transient failures count against the breaker.
 5. **Migrations are append-only.** Never edit an applied migration; add a new numbered file.

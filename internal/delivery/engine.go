@@ -44,6 +44,11 @@ type Options struct {
 	Retry            RetryPolicy
 	BreakerThreshold int
 	BreakerOpenFor   time.Duration
+	// PermitMaxAge is how old a rate-limit permit may be when its request is
+	// sent. It must not exceed the limiter's window margin: the limiter
+	// counts permits by when they were taken, and only the margin covers the
+	// gap between taking a permit and the request reaching the provider.
+	PermitMaxAge time.Duration
 }
 
 type Engine struct {
@@ -60,6 +65,9 @@ type Engine struct {
 func NewEngine(q Queue, l RateLimiter, p Provider, pub events.Publisher, log *slog.Logger, opts Options) *Engine {
 	if opts.GaugeInterval == 0 {
 		opts.GaugeInterval = 5 * time.Second
+	}
+	if opts.PermitMaxAge == 0 {
+		opts.PermitMaxAge = 50 * time.Millisecond
 	}
 	e := &Engine{
 		queue: q, limiter: l, provider: p, publisher: pub, log: log, opts: opts,
@@ -128,6 +136,7 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			continue
 		}
 
+		takenAt := time.Now()
 		grant, err := e.limiter.Take(ctx, key, want)
 		granted := grant.N
 		if err != nil {
@@ -170,16 +179,64 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 			e.refund(ctx, key, grant, unused)
 		}
 
-		for _, n := range items {
+		spawn := func(n domain.Notification) {
 			slots <- struct{}{}
 			inflight.Go(func() {
 				defer func() { <-slots }()
 				e.deliver(deliverCtx, breaker, n)
 			})
 		}
+		if age := time.Since(takenAt); len(items) > 0 && age > e.opts.PermitMaxAge {
+			// The claim took longer than the margin (database pause, GC,
+			// failover). Sending now on permits stamped back then could put
+			// more than the limit into one second at the provider, so give
+			// them back and take fresh ones.
+			e.refund(ctx, key, grant, granted)
+			observability.StalePermits.WithLabelValues(key).Inc()
+			e.log.Warn("claim outlived its rate-limit permits, re-taking them",
+				"channel", ch, "claim_ms", age.Milliseconds(), "items", len(items))
+			e.sendWithFreshPermits(deliverCtx, key, items, spawn)
+		} else {
+			for _, n := range items {
+				spawn(n)
+			}
+		}
 		if len(items) < granted {
 			sleep(ctx, e.opts.PollInterval) // queue drained, poll again shortly
 		}
+	}
+}
+
+// sendWithFreshPermits sends already-claimed rows as fresh permits become
+// available. It runs on a context detached from shutdown, because the rows
+// are leased to this worker; if permits cannot be had before half the lease
+// is gone (Redis down), it stops and the reaper returns the rest.
+func (e *Engine) sendWithFreshPermits(ctx context.Context, key string, items []domain.Notification, spawn func(domain.Notification)) {
+	deadline := time.Now().Add(e.opts.Lease / 2)
+	for len(items) > 0 {
+		takenAt := time.Now()
+		g, err := e.limiter.Take(ctx, key, len(items))
+		fresh := time.Since(takenAt) <= e.opts.PermitMaxAge
+		switch {
+		case err == nil && g.N > 0 && fresh:
+			for _, n := range items[:g.N] {
+				spawn(n)
+			}
+			items = items[g.N:]
+			continue
+		case err == nil && g.N > 0:
+			e.refund(ctx, key, g, g.N) // even this Take was slow
+		}
+		if time.Now().After(deadline) {
+			e.log.Error("no rate-limit permits for claimed notifications; the reaper will return them",
+				"channel", key, "items", len(items), "error", err)
+			return
+		}
+		wait := time.Second
+		if err == nil {
+			wait = max(g.Wait, 10*time.Millisecond)
+		}
+		sleep(ctx, wait)
 	}
 }
 

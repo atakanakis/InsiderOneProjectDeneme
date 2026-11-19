@@ -47,7 +47,12 @@ var (
 
 	RateLimited = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "notification_rate_limited_total",
-		Help: "Dispatcher loops that found no rate-limit tokens available.",
+		Help: "Dispatcher loops that found no rate-limit permits available.",
+	}, []string{"channel"})
+
+	StalePermits = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notification_stale_permits_total",
+		Help: "Claims that took longer than the rate-limit margin, so their permits were re-taken before sending.",
 	}, []string{"channel"})
 
 	CircuitState = promauto.NewGaugeVec(prometheus.GaugeOpts{
