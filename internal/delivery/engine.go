@@ -167,6 +167,12 @@ func (e *Engine) runChannel(ctx context.Context, ch domain.Channel) {
 		leaseEnd := time.Now().Add(e.opts.Lease) // the lease starts no earlier than this
 		items, err := e.queue.ClaimDue(claimCtx, ch, granted, e.opts.Lease)
 		cancelClaim()
+		if err != nil && len(items) > 0 {
+			// Some priorities were claimed and others failed: the claimed
+			// rows are ours now and must be sent, not dropped.
+			e.log.Error("claim partly failed", "channel", ch, "claimed", len(items), "error", err)
+			err = nil
+		}
 		if err != nil {
 			breaker.Release(granted)
 			e.refund(ctx, key, grant, granted)

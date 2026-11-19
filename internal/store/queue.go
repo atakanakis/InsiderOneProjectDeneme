@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -22,12 +23,18 @@ import (
 // (priority, next_attempt_at) cannot use next_attempt_at <= now() as an index
 // range, so millions of future high-priority rows (a campaign scheduled for
 // tomorrow) would be walked on every claim before reaching due normal rows.
-// Per priority, the dispatch index (channel, priority, next_attempt_at) gives
-// an exact range scan that stops at now().
+// Per priority, the dispatch index (channel, priority, next_attempt_at) both
+// filters and orders: the scan reads due rows in index order and stops after
+// `limit`. The order must match the index exactly. An earlier version added
+// "id" as a tie-break, so a campaign of 500k rows sharing one timestamp was
+// sorted in full on every 25-row claim (220 ms, a 19 MB on-disk sort);
+// TestClaimDoesNotSortTiedBacklog guards this.
 //
-// The per-priority statements run in one transaction: either every row is
-// claimed or none is. Otherwise a failure in a later statement would leave
-// earlier rows in "processing" with an attempt spent and nobody sending them.
+// Each priority runs under a savepoint inside one transaction. A failing
+// statement rolls back only its own priority, so it neither strands rows
+// (claimed but never returned) nor blocks the other priorities. ClaimDue
+// then returns the rows that were claimed together with the error, and the
+// caller must deliver those rows.
 func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, lease time.Duration) ([]domain.Notification, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -36,42 +43,34 @@ func (s *Store) ClaimDue(ctx context.Context, ch domain.Channel, limit int, leas
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
 
 	var out []domain.Notification
+	var errs []error
 	for _, p := range domain.Priorities {
 		if len(out) >= limit {
 			break
 		}
-		items, err := claimPriority(ctx, tx, ch, p, limit-len(out), lease)
+		sp, err := tx.Begin(ctx) // savepoint
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("claim due: %w", err)
+		}
+		items, err := claimPriority(ctx, sp, ch, p, limit-len(out), lease)
+		if err != nil {
+			_ = sp.Rollback(ctx)
+			errs = append(errs, fmt.Errorf("claim %s priority: %w", p, err))
+			continue
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("claim due: %w", err)
 		}
 		out = append(out, items...)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("claim due: %w", err)
 	}
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 func claimPriority(ctx context.Context, q querier, ch domain.Channel, p domain.Priority, limit int, lease time.Duration) ([]domain.Notification, error) {
-	rows, err := q.Query(ctx, `
-		WITH due AS (
-			SELECT id FROM notifications
-			WHERE channel = $1
-			  AND priority = $4
-			  AND status IN ('pending', 'retrying')
-			  AND next_attempt_at <= now()
-			ORDER BY next_attempt_at, id
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
-		)
-		UPDATE notifications n
-		SET status = 'processing',
-		    attempts = n.attempts + 1,
-		    locked_until = now() + make_interval(secs => $3),
-		    updated_at = now()
-		FROM due
-		WHERE n.id = due.id
-		RETURNING `+prefixed("n", notificationColumns),
+	rows, err := q.Query(ctx, claimSQL+prefixed("n", notificationColumns),
 		string(ch), limit, lease.Seconds(), p.Rank())
 	if err != nil {
 		return nil, fmt.Errorf("claim due: %w", err)
@@ -155,6 +154,28 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 	}
 	return n, nil
 }
+
+// claimSQL claims due rows of one channel and priority. Its ORDER BY matches
+// the dispatch index exactly; see ClaimDue.
+const claimSQL = `
+		WITH due AS (
+			SELECT id FROM notifications
+			WHERE channel = $1
+			  AND priority = $4
+			  AND status IN ('pending', 'retrying')
+			  AND next_attempt_at <= now()
+			ORDER BY next_attempt_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE notifications n
+		SET status = 'processing',
+		    attempts = n.attempts + 1,
+		    locked_until = now() + make_interval(secs => $3),
+		    updated_at = now()
+		FROM due
+		WHERE n.id = due.id
+		RETURNING `
 
 // ReleaseClaims gives claimed rows back without spending an attempt, for a
 // worker that claimed them but will not send them (shutdown, or no

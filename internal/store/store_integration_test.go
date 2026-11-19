@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -257,10 +258,10 @@ func TestFutureHighPriorityBacklogDoesNotBlockDueRows(t *testing.T) {
 	assert.Equal(t, low.ID, got[1].ID)
 }
 
-// Regression (review 2): claims run one statement per priority. If a later
-// statement failed, rows from the earlier ones stayed "processing" with an
-// attempt spent and nobody sending them.
-func TestClaimIsAllOrNothing(t *testing.T) {
+// Regression (reviews 2 and 3): claims run one statement per priority. A
+// failure in one priority must neither strand rows from another (claimed
+// but not returned, an attempt spent) nor block the other priorities.
+func TestFailingPriorityNeitherStrandsNorBlocksOthers(t *testing.T) {
 	env := testutil.Setup(t)
 	s := store.New(env.Pool)
 	ctx := context.Background()
@@ -284,12 +285,49 @@ func TestClaimIsAllOrNothing(t *testing.T) {
 	})
 
 	got, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, time.Minute)
-	require.Error(t, err)
-	assert.Empty(t, got)
-	n, err := s.GetNotification(ctx, high.ID)
+	require.Error(t, err, "the failure is reported")
+	require.Len(t, got, 1, "high priority is still claimed and returned")
+	assert.Equal(t, high.ID, got[0].ID)
+
+	n, err := s.GetNotification(ctx, normal.ID)
 	require.NoError(t, err)
-	assert.Equal(t, domain.StatusPending, n.Status, "the high-priority claim was rolled back")
+	assert.Equal(t, domain.StatusPending, n.Status, "the failed priority is rolled back")
 	assert.Equal(t, 0, n.Attempts)
+}
+
+// Regression (review 3): with "id" as a tie-break the claim sorted every
+// due row sharing a timestamp. The plan must read the index in order.
+func TestClaimDoesNotSortTiedBacklog(t *testing.T) {
+	env := testutil.Setup(t)
+	ctx := context.Background()
+	_, err := env.Pool.Exec(ctx, `
+		INSERT INTO notifications (id, recipient, channel, content, priority, status, max_attempts,
+		                           next_attempt_at, correlation_id)
+		SELECT gen_random_uuid(), '+905551234567', 'sms', 'hi', 2, 'pending', 5,
+		       '2026-01-01T09:00:00Z', 'c'
+		FROM generate_series(1, 50000)`)
+	require.NoError(t, err)
+	_, err = env.Pool.Exec(ctx, `ANALYZE notifications`)
+	require.NoError(t, err)
+
+	rows, err := env.Pool.Query(ctx, `EXPLAIN `+store.ClaimSQL+`n.id`, "sms", 25, 30.0, 2)
+	require.NoError(t, err)
+	var lines []string
+	for rows.Next() {
+		var l string
+		require.NoError(t, rows.Scan(&l))
+		lines = append(lines, l)
+	}
+	require.NoError(t, rows.Err())
+	full := strings.Join(lines, "\n")
+	assert.NotContains(t, full, "Sort", full)
+	assert.Contains(t, full, "idx_notifications_dispatch", full)
+
+	start := time.Now()
+	got, err := store.New(env.Pool).ClaimDue(ctx, domain.ChannelSMS, 25, time.Minute)
+	require.NoError(t, err)
+	assert.Len(t, got, 25)
+	t.Logf("claim of 25 from 50k tied rows took %s", time.Since(start))
 }
 
 func TestReleaseClaimsRefundsTheAttempt(t *testing.T) {
