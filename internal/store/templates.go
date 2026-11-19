@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -49,18 +50,32 @@ func (s *Store) GetTemplateByName(ctx context.Context, name string) (domain.Temp
 	return t, err
 }
 
-func (s *Store) ListTemplates(ctx context.Context) ([]domain.Template, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+templateColumns+` FROM templates ORDER BY name`)
+// TemplateSummary is a template without its body, for listings: bodies can
+// be 100 KB each, and a list of full templates grew without bound.
+type TemplateSummary struct {
+	ID        uuid.UUID      `json:"id"`
+	Name      string         `json:"name"`
+	Channel   domain.Channel `json:"channel"`
+	CreatedAt time.Time      `json:"createdAt"`
+}
+
+// ListTemplates returns up to limit summaries ordered by name, starting
+// after the given name (keyset pagination; names are unique).
+func (s *Store) ListTemplates(ctx context.Context, after string, limit int) ([]TemplateSummary, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, channel, created_at FROM templates WHERE name > $1 ORDER BY name LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []domain.Template{}
+	out := []TemplateSummary{}
 	for rows.Next() {
-		t, err := scanTemplate(rows)
-		if err != nil {
+		var t TemplateSummary
+		var ch string
+		if err := rows.Scan(&t.ID, &t.Name, &ch, &t.CreatedAt); err != nil {
 			return nil, err
 		}
+		t.Channel = domain.Channel(ch)
 		out = append(out, t)
 	}
 	return out, rows.Err()

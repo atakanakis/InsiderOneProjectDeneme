@@ -19,7 +19,7 @@ import (
 // output length from per-variable counts before building anything, so the
 // cost of rejecting an oversized result does not depend on how many
 // placeholders the body has.
-var placeholder = regexp.MustCompile(`\{\{\s*\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}`)
+var placeholder = regexp.MustCompile(`\{\{\s*\.([A-Za-z_][A-Za-z0-9_]{0,63})\s*\}\}`)
 
 // CompiledTemplate is a template body split into literal text and
 // placeholders.
@@ -101,6 +101,12 @@ func (c *CompiledTemplate) RenderedLength(vars map[string]string) (int, error) {
 		n += c.uses[name] * utf8.RuneCountInString(v)
 	}
 	if len(missing) > 0 {
+		// Name a few, count the rest: the message must stay small however
+		// many variables the template has.
+		const show = 5
+		if extra := len(missing) - show; extra > 0 {
+			return 0, fmt.Errorf("missing variables: %s and %d more", strings.Join(missing[:show], ", "), extra)
+		}
 		return 0, fmt.Errorf("missing variables: %s", strings.Join(missing, ", "))
 	}
 	return n, nil

@@ -41,7 +41,11 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, log *slog.Logger,
 	var verr *domain.ValidationError
 	switch {
 	case errors.As(err, &verr):
-		writeError(w, http.StatusUnprocessableEntity, "validation_failed", "the request is invalid", verr.Fields...)
+		msg := "the request is invalid"
+		if verr.Omitted > 0 {
+			msg = fmt.Sprintf("the request is invalid; showing the first %d problems, more were found", len(verr.Fields))
+		}
+		writeError(w, http.StatusUnprocessableEntity, "validation_failed", msg, verr.Fields...)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, store.ErrIdempotencyMismatch):

@@ -128,7 +128,8 @@ paths:
             gets `batch:<key>:<index>`, so re-sending the same batch with the
             same header replays it instead of sending every message again.
             It works item by item: a changed item returns `409`, an added item
-            is created.
+            is created. Keys starting with `batch:` are reserved and rejected
+            when sent by a client.
           schema: { type: string, maxLength: 118 }
       requestBody:
         required: true
@@ -271,16 +272,30 @@ paths:
     get:
       tags: [Templates]
       summary: List templates
+      description: Summaries ordered by name, without bodies. Pass `nextAfter` as `after` for the next page.
       operationId: listTemplates
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: after, in: query, description: Return templates whose name sorts after this one., schema: { type: string } }
       responses:
         '200':
-          description: All templates.
+          description: One page of templates.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  items: { type: array, items: { $ref: '#/components/schemas/Template' } }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string }
+                        channel: { $ref: '#/components/schemas/Channel' }
+                        createdAt: { type: string, format: date-time }
+                  nextAfter: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   /v1/templates/{id}:
     get:

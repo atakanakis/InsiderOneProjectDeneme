@@ -409,6 +409,53 @@ func TestTemplateBatchCannotAmplifyIntoGigabytes(t *testing.T) {
 	assert.Contains(t, fmt.Sprint(body), "rendered content exceeds")
 }
 
+// Regression (review 3): the error path amplified too. 1000 items that
+// each miss 9,900 variables used to produce a 68 MB response.
+func TestValidationResponseStaysSmall(t *testing.T) {
+	c := newServer(t)
+	var tplBody strings.Builder
+	for i := range 9900 {
+		fmt.Fprintf(&tplBody, "{{.v%d}}", i)
+	}
+	resp, tpl := c.do("POST", "/v1/templates", map[string]any{"name": "many", "channel": "email", "body": tplBody.String()})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	items := make([]any, 1000)
+	for i := range items {
+		items[i] = map[string]any{"recipient": "a@b.co", "channel": "email", "templateId": tpl["id"]}
+	}
+	b, err := json.Marshal(map[string]any{"notifications": items})
+	require.NoError(t, err)
+	raw, err := http.Post(c.base+"/v1/notifications/batch", "application/json", bytes.NewReader(b))
+	require.NoError(t, err)
+	defer raw.Body.Close()
+	out, err := io.ReadAll(raw.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnprocessableEntity, raw.StatusCode)
+	assert.Less(t, len(out), 64<<10, "response was %d bytes", len(out))
+	assert.Contains(t, string(out), "showing the first 100 problems")
+}
+
+func TestTemplateListIsPagedAndOmitsBodies(t *testing.T) {
+	c := newServer(t)
+	for _, name := range []string{"a", "b", "c"} {
+		resp, _ := c.do("POST", "/v1/templates", map[string]any{"name": name, "channel": "sms", "body": "Hi {{.n}}"})
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+	}
+	resp, page := c.do("GET", "/v1/templates?limit=2", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	items := page["items"].([]any)
+	require.Len(t, items, 2)
+	assert.NotContains(t, items[0].(map[string]any), "body")
+	assert.Equal(t, "b", page["nextAfter"])
+
+	_, page = c.do("GET", "/v1/templates?limit=2&after=b", nil)
+	require.Len(t, page["items"].([]any), 1)
+	assert.Nil(t, page["nextAfter"])
+
+	resp, _ = c.do("GET", "/v1/templates?limit=9999", nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestWebSocketStreamsStatusChanges(t *testing.T) {
 	c := newServer(t)
 	_, n := c.do("POST", "/v1/notifications", sms("hi"))
@@ -484,6 +531,16 @@ func TestBatchIdempotencyKeyHeader(t *testing.T) {
 
 	resp, _ = c.do("POST", "/v1/notifications/batch", req, "Idempotency-Key", strings.Repeat("k", 119))
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	// Clients cannot pick keys in the namespace derived keys live in.
+	resp, body := c.do("POST", "/v1/notifications", sms("one"), "Idempotency-Key", "batch:campaign-42:0")
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Equal(t, []string{"idempotencyKey"}, errorFields(body))
+	own := sms("x")
+	own["idempotencyKey"] = "batch:other:1"
+	resp, body = c.do("POST", "/v1/notifications/batch", map[string]any{"notifications": []any{own}})
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Equal(t, []string{"notifications[0].idempotencyKey"}, errorFields(body))
 }
 
 func TestResendingAWholeBatchReturnsTheOriginalBatch(t *testing.T) {

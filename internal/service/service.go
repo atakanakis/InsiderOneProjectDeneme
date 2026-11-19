@@ -95,6 +95,11 @@ func (s *Service) CreateBatch(ctx context.Context, inputs []CreateInput, meta Re
 	seenKeys := map[string]int{}
 	items := make([]domain.Notification, len(inputs))
 	for i, in := range inputs {
+		if verr.Full() {
+			// Enough to act on; validating the rest would only cost CPU.
+			verr.Omitted += len(inputs) - i
+			break
+		}
 		prefix := fmt.Sprintf("notifications[%d].", i)
 		if in.IdempotencyKey != nil {
 			if j, dup := seenKeys[*in.IdempotencyKey]; dup {
@@ -381,8 +386,8 @@ func (s *Service) GetTemplate(ctx context.Context, id uuid.UUID) (domain.Templat
 	return s.store.GetTemplate(ctx, id)
 }
 
-func (s *Service) ListTemplates(ctx context.Context) ([]domain.Template, error) {
-	return s.store.ListTemplates(ctx)
+func (s *Service) ListTemplates(ctx context.Context, after string, limit int) ([]store.TemplateSummary, error) {
+	return s.store.ListTemplates(ctx, after, limit)
 }
 
 // MetricsSnapshot is the human-friendly real-time view served on /v1/metrics.

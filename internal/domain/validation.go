@@ -40,11 +40,25 @@ type FieldError struct {
 	Message string `json:"message"`
 }
 
-// ValidationError collects every problem with a request instead of stopping
-// at the first one, so clients can fix everything in one round trip.
+// Bounds on a validation response. Without them a small request can buy a
+// huge error body: a batch of 1000 items that each list 9,900 missing
+// template variables produced a 68 MB response.
+const (
+	MaxFieldErrors       = 100
+	maxFieldErrorMessage = 300
+)
+
+// ValidationError collects the problems with a request instead of stopping
+// at the first one, so clients can fix everything in one round trip. It
+// keeps at most MaxFieldErrors of them and counts the rest.
 type ValidationError struct {
-	Fields []FieldError
+	Fields  []FieldError
+	Omitted int // problems found after the first MaxFieldErrors
 }
+
+// Full reports whether further problems would only be counted, so callers
+// can stop validating early.
+func (e *ValidationError) Full() bool { return len(e.Fields) >= MaxFieldErrors }
 
 func (e *ValidationError) Error() string {
 	parts := make([]string, len(e.Fields))
@@ -55,7 +69,15 @@ func (e *ValidationError) Error() string {
 }
 
 func (e *ValidationError) Add(field, format string, args ...any) {
-	e.Fields = append(e.Fields, FieldError{Field: field, Message: fmt.Sprintf(format, args...)})
+	if e.Full() {
+		e.Omitted++
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if len(msg) > maxFieldErrorMessage {
+		msg = strings.ToValidUTF8(msg[:maxFieldErrorMessage], "") + "..."
+	}
+	e.Fields = append(e.Fields, FieldError{Field: field, Message: msg})
 }
 
 // Err returns nil when no field error was recorded.

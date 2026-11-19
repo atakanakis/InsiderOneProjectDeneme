@@ -42,6 +42,10 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 		}
 		in.IdempotencyKey = &key
 	}
+	if reservedKey(in.IdempotencyKey) {
+		writeServiceError(w, r, s.log, reservedKeyError("idempotencyKey"))
+		return
+	}
 	n, created, err := s.svc.Create(r.Context(), in, meta(r))
 	if err != nil {
 		writeServiceError(w, r, s.log, err)
@@ -57,7 +61,20 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 }
 
 // Room for "batch:" and ":<index>" within domain.MaxIdempotencyKeyLength.
-const maxBatchKeyLength = domain.MaxIdempotencyKeyLength - len("batch:") - len(":999")
+const maxBatchKeyLength = domain.MaxIdempotencyKeyLength - len(batchKeyPrefix) - len(":999")
+
+// Keys starting with "batch:" are the ones this API derives from a batch
+// header. Clients may not choose them, or a single request could
+// impersonate (or be replayed as) an item of someone's batch.
+const batchKeyPrefix = "batch:"
+
+func reservedKey(key *string) bool { return key != nil && strings.HasPrefix(*key, batchKeyPrefix) }
+
+func reservedKeyError(field string) error {
+	var verr domain.ValidationError
+	verr.Add(field, "must not start with %q, which is reserved", batchKeyPrefix)
+	return &verr
+}
 
 type batchRequest struct {
 	Notifications []service.CreateInput `json:"notifications"`
@@ -90,6 +107,12 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, maxBatchBody, &req) {
 		return
 	}
+	for i := range req.Notifications {
+		if reservedKey(req.Notifications[i].IdempotencyKey) {
+			writeServiceError(w, r, s.log, reservedKeyError(fmt.Sprintf("notifications[%d].idempotencyKey", i)))
+			return
+		}
+	}
 	if key := r.Header.Get("Idempotency-Key"); key != "" {
 		if len(key) > maxBatchKeyLength {
 			writeError(w, http.StatusBadRequest, "invalid_idempotency_key",
@@ -98,7 +121,7 @@ func (s *Server) createBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		for i := range req.Notifications {
 			if req.Notifications[i].IdempotencyKey == nil {
-				k := fmt.Sprintf("batch:%s:%d", key, i)
+				k := fmt.Sprintf("%s%s:%d", batchKeyPrefix, key, i)
 				req.Notifications[i].IdempotencyKey = &k
 			}
 		}
@@ -287,13 +310,29 @@ func (s *Server) createTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, t)
 }
 
+// GET /v1/templates?limit=&after=  (summaries without bodies, by name)
 func (s *Server) listTemplates(w http.ResponseWriter, r *http.Request) {
-	ts, err := s.svc.ListTemplates(r.Context())
+	q := r.URL.Query()
+	limit := 50
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
+			return
+		}
+		limit = n
+	}
+	ts, err := s.svc.ListTemplates(r.Context(), q.Get("after"), limit+1)
 	if err != nil {
 		writeServiceError(w, r, s.log, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": ts})
+	var next *string
+	if len(ts) > limit {
+		ts = ts[:limit]
+		next = &ts[limit-1].Name
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": ts, "nextAfter": next})
 }
 
 func (s *Server) getTemplate(w http.ResponseWriter, r *http.Request) {

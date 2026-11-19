@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -165,4 +166,30 @@ func TestRenderedLengthDoesNotScaleWithPlaceholderCount(t *testing.T) {
 		require.Equal(t, 112_000, n)
 	}
 	assert.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+// Regression (review 3): a template with 9,900 variables and a 1000-item
+// batch without variables turned a 99 KB request into a 68 MB response.
+func TestValidationOutputIsBounded(t *testing.T) {
+	var body strings.Builder
+	for i := range 9900 {
+		fmt.Fprintf(&body, "{{.v%d}}", i)
+	}
+	c, err := CompileTemplate(body.String())
+	require.NoError(t, err)
+	_, err = c.Render(nil, 100_000)
+	require.Error(t, err)
+	assert.Less(t, len(err.Error()), 200)
+	assert.Contains(t, err.Error(), "and 9895 more")
+
+	var v ValidationError
+	for i := range 1000 {
+		v.Add(fmt.Sprintf("notifications[%d].variables", i), "%s", strings.Repeat("x", 5000))
+	}
+	assert.Len(t, v.Fields, MaxFieldErrors)
+	assert.Equal(t, 900, v.Omitted)
+	assert.LessOrEqual(t, len(v.Fields[0].Message), 310)
+
+	_, err = CompileTemplate("{{." + strings.Repeat("a", 65) + "}}")
+	assert.Error(t, err, "variable names are capped at 64 characters")
 }
