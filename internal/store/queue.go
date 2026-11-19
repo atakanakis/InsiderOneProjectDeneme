@@ -64,7 +64,7 @@ type AttemptResult struct {
 	Error             *string
 	Duration          time.Duration
 	NewStatus         domain.Status // sent, retrying or failed
-	NextAttemptAt     *time.Time    // only for retrying
+	RetryDelay        time.Duration // only for retrying; added to the database clock
 	ProviderMessageID *string
 }
 
@@ -92,7 +92,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 	n, err := scanNotification(tx.QueryRow(ctx, `
 		UPDATE notifications
 		SET status = $3,
-		    next_attempt_at = COALESCE($4, next_attempt_at),
+		    next_attempt_at = CASE WHEN $3 = 'retrying' THEN now() + make_interval(secs => $4) ELSE next_attempt_at END,
 		    provider_message_id = COALESCE($5, provider_message_id),
 		    last_error = $6,
 		    sent_at = CASE WHEN $3 = 'sent' THEN now() ELSE sent_at END,
@@ -100,7 +100,7 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 		    updated_at = now()
 		WHERE id = $1 AND status = 'processing' AND attempts = $2
 		RETURNING `+notificationColumns,
-		r.NotificationID, r.AttemptNumber, string(r.NewStatus), r.NextAttemptAt,
+		r.NotificationID, r.AttemptNumber, string(r.NewStatus), r.RetryDelay.Seconds(),
 		r.ProviderMessageID, r.Error))
 	stale := err != nil
 	if stale && !isNoRows(err) {

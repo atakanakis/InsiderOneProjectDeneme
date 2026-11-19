@@ -172,14 +172,10 @@ func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, ba
 		verr.Add(field(f.Field), "%s", f.Message)
 	}
 
-	next := now
 	var scheduled *time.Time
 	if in.ScheduledAt != nil {
 		at := in.ScheduledAt.UTC()
 		scheduled = &at
-		if at.After(now) {
-			next = at
-		}
 	}
 	return domain.Notification{
 		ID:             uuid.New(),
@@ -192,8 +188,7 @@ func (s *Service) prepare(ctx context.Context, in CreateInput, prefix string, ba
 		Status:         domain.StatusPending,
 		TemplateID:     in.TemplateID,
 		MaxAttempts:    s.maxAttempts,
-		ScheduledAt:    scheduled,
-		NextAttemptAt:  next,
+		ScheduledAt:    scheduled, // next_attempt_at is derived from it by the database
 		CorrelationID:  meta.CorrelationID,
 		TraceParent:    meta.TraceParent,
 	}

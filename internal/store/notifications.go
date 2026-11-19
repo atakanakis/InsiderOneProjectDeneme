@@ -50,17 +50,19 @@ func collectNotifications(rows pgx.Rows) ([]domain.Notification, error) {
 	return out, rows.Err()
 }
 
+// next_attempt_at comes from the database clock (later of now() and the
+// schedule). Every queue time is compared against Postgres' now(), so using
+// one clock avoids skew between API hosts and the database.
 const insertSQL = `
 INSERT INTO notifications (id, batch_id, idempotency_key, recipient, channel, content, priority, status,
 	template_id, max_attempts, scheduled_at, next_attempt_at, correlation_id, trace_parent)
-VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $11, $12, $13)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, GREATEST(now(), COALESCE($10, now())), $11, $12)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING ` + notificationColumns
 
 func insertArgs(n domain.Notification) []any {
 	return []any{n.ID, n.BatchID, n.IdempotencyKey, n.Recipient, string(n.Channel), n.Content,
-		n.Priority.Rank(), n.TemplateID, n.MaxAttempts, n.ScheduledAt, n.NextAttemptAt,
-		n.CorrelationID, n.TraceParent}
+		n.Priority.Rank(), n.TemplateID, n.MaxAttempts, n.ScheduledAt, n.CorrelationID, n.TraceParent}
 }
 
 // CreateResult tells the caller whether a row was newly created or an earlier

@@ -226,8 +226,7 @@ func (e *Engine) deliver(ctx context.Context, breaker *Breaker, n domain.Notific
 		result.Error = &msg
 		if n.Attempts < n.MaxAttempts {
 			result.NewStatus = domain.StatusRetrying
-			next := time.Now().Add(e.opts.Retry.NextDelay(n.Attempts, res.RetryAfter))
-			result.NextAttemptAt = &next
+			result.RetryDelay = e.opts.Retry.NextDelay(n.Attempts, res.RetryAfter)
 		} else {
 			result.NewStatus = domain.StatusFailed
 			msg = fmt.Sprintf("giving up after %d attempts: %s", n.Attempts, msg)
