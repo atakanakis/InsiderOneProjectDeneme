@@ -1,0 +1,64 @@
+# Alerts for the notification engine. Thresholds are starting points for a
+# 100 msg/s per channel deployment; tune them to real traffic.
+#
+# Note on aggregation: every worker exports the same database-wide queue
+# gauges, so they are combined with max(), never sum().
+groups:
+  - name: notification-engine
+    rules:
+      - alert: DeadLetterGrowing
+        expr: sum by (channel) (increase(notifications_finished_total{status="failed"}[10m])) > 20
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value | humanize }} notifications dead-lettered in 10m"
+          description: Check lastError on failed notifications; after fixing the cause, POST /v1/notifications/{id}/retry.
+
+      - alert: CircuitBreakerOpen
+        expr: max by (channel) (notification_circuit_breaker_state) == 2
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.channel }}: provider considered down for 2m (breaker open)"
+          description: Messages wait in the queue with their attempts intact; check the provider's status.
+
+      - alert: ReadyBacklogNotDraining
+        expr: max by (channel) (sum by (instance, channel) (notification_queue_depth)) > 6000
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value }} due notifications waiting for 10m"
+          description: More than a minute of traffic at 100/s is due and not shrinking. Either a burst larger than the limit allows, or delivery is stalled.
+
+      - alert: DeliveryFailureRateHigh
+        expr: |
+          sum by (channel) (rate(notification_delivery_attempts_total{outcome!="delivered"}[5m]))
+            / sum by (channel) (rate(notification_delivery_attempts_total[5m])) > 0.2
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.channel }}: {{ $value | humanizePercentage }} of provider calls failing"
+          description: A partly failing provider may not trip the breaker, which opens on consecutive failures only.
+
+      - alert: StalePermitsFrequent
+        expr: sum by (channel) (rate(notification_stale_permits_total[5m])) > 1
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.channel }}: claims or connections often slower than the rate-limit margin"
+          description: The limit still holds (permits are re-taken), but throughput drops. Check database latency and provider connection setup.
+
+      - alert: ProviderLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (channel, le) (rate(notification_provider_request_duration_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.channel }}: provider p95 latency above 2s"
+
+      - alert: WorkerDown
+        expr: up{job="worker"} == 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: "worker {{ $labels.instance }} is not being scraped"
