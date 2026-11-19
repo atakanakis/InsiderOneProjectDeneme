@@ -51,7 +51,18 @@ commit explaining the fix.
    to `/` instead of `/v1/traces`; nothing errors, Jaeger just stays empty. Found by checking
    Jaeger for the trace ID that webhook.site received in `traceparent`. (`fix(tracing): ...`)
 
-None of these would have been caught by unit tests with mocks, and all five would have shipped
+## Independent review
+
+After the suite was green, a second agent reviewed the code cold: it got the files and the
+requirements but not my reasoning or my conclusions, so it could not just agree with me. It
+confirmed the core (dispatcher, leases, limiter, breaker, cursor) and reported seven edge
+cases, all fixed with regression tests in one commit (`fix: edge cases found by an
+independent review pass`): a re-sent batch returning a batch ID that 404'd, `\u0000` causing
+a 500 instead of a 422, a shutdown window that could strand claimed rows, a possible deadlock
+between batches with overlapping idempotency keys, replays with a different schedule being
+accepted, unvalidated timing settings, and missing error codes in the OpenAPI spec.
+
+None of the first five defects would have been caught by unit tests with mocks, and all five would have shipped
 if "the code compiles and the agent says it works" were the bar.
 
 ## What stays human
