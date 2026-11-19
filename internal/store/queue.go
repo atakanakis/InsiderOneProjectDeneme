@@ -162,9 +162,9 @@ func (s *Store) CompleteAttempt(ctx context.Context, r AttemptResult) (domain.No
 // longer holds are left alone.
 func (s *Store) ReleaseClaims(ctx context.Context, items []domain.Notification) error {
 	ids := make([]uuid.UUID, len(items))
-	attempts := make([]int32, len(items))
+	attempts := make([]int, len(items))
 	for i, n := range items {
-		ids[i], attempts[i] = n.ID, int32(n.Attempts)
+		ids[i], attempts[i] = n.ID, n.Attempts
 	}
 	_, err := s.pool.Exec(ctx, `
 		UPDATE notifications n

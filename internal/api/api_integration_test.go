@@ -402,11 +402,11 @@ func TestTemplateBatchCannotAmplifyIntoGigabytes(t *testing.T) {
 		items[i] = map[string]any{"recipient": "a@b.co", "channel": "email",
 			"templateId": tpl["id"], "variables": map[string]string{"a": "xxxxxx"}}
 	}
-	start := time.Now()
+	// Takes about 0.2 s without the race detector (it was 8-9 s); timing is
+	// asserted in the domain test, where instrumentation does not distort it.
 	resp, body := c.do("POST", "/v1/notifications/batch", map[string]any{"notifications": items})
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 	assert.Contains(t, fmt.Sprint(body), "rendered content exceeds")
-	assert.Less(t, time.Since(start), 3*time.Second)
 }
 
 func TestWebSocketStreamsStatusChanges(t *testing.T) {
