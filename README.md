@@ -1,6 +1,14 @@
 # Event-Driven Notification System
 
-[![CI](https://github.com/atakanakis/notification-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/atakanakis/notification-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/atakanakis/InsiderOneProjectDeneme/actions/workflows/ci.yml/badge.svg)](https://github.com/atakanakis/InsiderOneProjectDeneme/actions/workflows/ci.yml)
+
+> **This is the first version, kept as a record** ("deneme" is Turkish for "trial"). It works
+> and is left as it was after its last review. A fifth independent review found further
+> defects that were not patched here (listed in the rebuild's
+> [journey](https://github.com/atakanakis/InsiderOneProject/blob/main/docs/journey.md)).
+> Instead, the project is being rebuilt from the lessons of this version, design first, at
+> [InsiderOneProject](https://github.com/atakanakis/InsiderOneProject). The repository was
+> renamed from `notification-engine`; the Go module path in `go.mod` still has the old name.
 
 A Go service that accepts notification requests (SMS, email, push), queues them durably and
 delivers them asynchronously, with a hard per-channel rate limit, priorities, retries with
